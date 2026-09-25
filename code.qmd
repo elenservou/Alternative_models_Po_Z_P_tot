@@ -1,0 +1,3642 @@
+---
+title: "Po,z,Ptot estimation"
+author: "Eleni Servou"
+date: todays
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-float: true
+    code-fold: true         
+    code-summary: "Hide/Show "
+    code-tools:
+      toggle: true         
+---
+
+## Load libraries and prepare data
+```{r}
+library(readxl)
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(glmmTMB)
+library(sdmTMB)
+library(cowplot)
+library(gt)
+library(DHARMa)
+library(sf)
+library(INLA)
+library(sdmTMBextra)
+library(writexl)
+library(scales)
+library(tidyr)
+library(stringr)
+library(viridis)
+library(patchwork)
+library(RColorBrewer)
+library(gstat)
+```
+
+## Load egg data
+```{r}
+# Eastern stratum (2006)
+Str1_06 <- read_xlsx("data.xlsx", sheet = "2006 east")
+Str1_06$Survey <- "Str1_06"
+
+# Western stratum (2006)
+Str2_06 <- read_xlsx("data.xlsx", sheet = "2006 west")
+Str2_06$Survey <- "Str2_06"
+```
+
+
+## For mapping
+```{r}
+# Load coastline data for Greece
+coast <- st_read("Greece_geology/Greece/land_poly_GR.gpkg", quiet = TRUE) %>% 
+  st_transform(crs = "WGS84")
+
+# Transform coordinates to km (UTM Zone 35N)
+coast_km <- st_transform(coast, crs = 32635)
+st_geometry(coast_km) <- st_geometry(coast_km) / 1000## For mapping
+
+# Load coastline data for Greece
+coast <- st_read("Greece_geology/Greece/land_poly_GR.gpkg", quiet = TRUE) %>% 
+  st_transform(crs = "WGS84")
+
+# Transform coordinates to km (UTM Zone 35N)
+coast_km <- st_transform(coast, crs = 32635)
+st_geometry(coast_km) <- st_geometry(coast_km) / 1000
+```
+
+## Voronoi polygons of A1 
+```{r}
+# Read shapefiles and transform to WGS84
+PA_2006_Str1 <- st_read("voronois/str1_sd_2006_dis.shp") %>% 
+  st_transform(crs = "WGS84")
+
+PA_2006_Str2 <- st_read("voronois/str2_sd_2006_dis.shp") %>% 
+  st_transform(crs = "WGS84")
+
+# Transform coordinates to kilometers (UTM Zone 35N) - Eastern stratum
+PA_2006_Str1 <- PA_2006_Str1 %>% 
+  st_transform(crs = 32635)
+st_geometry(PA_2006_Str1) <- st_geometry(PA_2006_Str1) / 1000
+
+# Transform coordinates to kilometers (UTM Zone 35N) - Western stratum
+PA_2006_Str2 <- PA_2006_Str2 %>% 
+  st_transform(crs = 32635)
+st_geometry(PA_2006_Str2) <- st_geometry(PA_2006_Str2) / 1000
+
+
+# Extract total spawning area (converted to m²)
+area_Str1 <- c(as.numeric(PA_2006_Str1$Area)*10^6)
+               
+area_Str2 <- c(as.numeric(PA_2006_Str2$Area)*10^6)
+```
+
+## Estimate station weights
+```{r}
+# Calculate weights for Eastern stratum 
+Str1_06_w <- Str1_06 %>%
+  distinct(Station, .keep_all = TRUE) %>%
+  mutate(total_km = sum(km_2, na.rm = TRUE)) %>%
+  mutate(w_sn = km_2 / mean(km_2, na.rm = TRUE))
+
+Str1_06 <- Str1_06 %>%
+  left_join(Str1_06_w %>% select(Station, w_sn), by = "Station") %>%
+  add_utm_columns(
+    ll_names = c("Lon", "Lat"),
+    ll_crs = "WGS84",
+    utm_crs = 32635,
+    utm_names = c("X", "Y"),
+    units = "km")
+
+# Calculate weights for Western stratum
+Str2_06_w <- Str2_06 %>%
+  distinct(Station, .keep_all = TRUE) %>%
+  mutate(total_km = sum(km_2, na.rm = TRUE)) %>%
+  mutate(w_sn = km_2 / mean(km_2, na.rm = TRUE))
+
+Str2_06 <- Str2_06 %>%
+  left_join(Str2_06_w %>% select(Station, w_sn), by = "Station") %>%
+  add_utm_columns(
+    ll_names = c("Lon", "Lat"),
+    ll_crs = "WGS84",
+    utm_crs = 32635,
+    utm_names = c("X", "Y"),
+    units = "km"
+  )
+
+
+```
+
+
+# Model 0: Weighted non-linear least squares regression model
+
+The classic weighted exponential model of Picquelle and Stauffer 1985 used in Somarakis et al. 2012
+
+### Write M0 function 
+```{r}
+#Crate a function that will do everything at once
+
+fit_M0_model_M0 <- function(data) {
+# Get dataframe name
+  df_name <- deparse(substitute(data))
+  model_name <- paste0("model_M0", df_name)
+  Survey <- as.character(data$Survey[1])
+  
+# Build dynamic object names
+  plot_name <- paste0("plot_M0_", df_name)
+  plot_log_name <- paste0("plot_log_M0_", df_name)
+  df_pred_name <- paste0("pred_M0_", df_name)
+  P_est_name <- paste0("P_est_M0_", df_name)
+  z_est_name <- paste0("z_est_M0_", df_name)
+  
+  P_se_name <- paste0("P_se_M0_", df_name)
+  z_se_name <- paste0("z_se_M0_", df_name)
+  
+  P_ci_name <- paste0("P_ci_M0_", df_name)
+  z_ci_name <- paste0("z_ci_M0_", df_name)
+  
+# Set a range of initial values and fit model
+  model0 <- nls.multstart::nls_multstart(
+    Abundance ~ P * exp(-z * Age),
+    data = data,
+    iter = 250,
+    convergence_count = FALSE,
+    start_lower = c(P = 50, z = 0.1),
+    start_upper = c(P = 200, z = 0.8),
+    modelweights = data$w_sn,
+    na.action = na.omit
+  )
+  
+assign(model_name, model0, envir = .GlobalEnv)
+
+# Summary
+  m <- summary(model0)
+  print(m)
+  
+  # Extract params
+  params <- coef(model0)
+  P_est <- params["P"]
+  z_est <- params["z"]
+  
+  # SEs
+  P_se <- m$parameters["P", "Std. Error"]
+  z_se <- m$parameters["z", "Std. Error"]
+  
+  # CIs
+  ci <- confint(model0)
+  P_ci <- ci["P", ]
+  z_ci <- ci["z", ]
+  
+# Output tables
+  outablePo <- data.frame(
+    dataset   = c(Survey),
+    parameter = c("P"),
+    estimate  = c(P_est),
+    se        = c(P_se),
+    ci_lower  = c(P_ci[1]),
+    ci_upper  = c(P_ci[2]),
+    CV        = c(P_se / P_est),
+    model     = "M0",
+    stringsAsFactors = FALSE
+  )
+  
+  outableZ <- data.frame(
+    dataset   = c(Survey),
+    parameter = c("z"),
+    estimate  = c(z_est),
+    se        = c(z_se),
+    ci_lower  = c(z_ci[1]),
+    ci_upper  = c(z_ci[2]),
+    CV        = c(z_se / z_est),
+    model     = "M0",
+    stringsAsFactors = FALSE
+  )
+  
+# Generate predictions for plotting
+  x_new <- seq(
+    min(data$Age, na.rm = TRUE),
+    max(data$Age, na.rm = TRUE),
+    length.out = 10000
+  )
+  
+  y_pred <- predict(model0, newdata = data.frame(Age = x_new))
+  df_pred <- data.frame(x = x_new, y = y_pred)
+
+# Plot
+  plot <- ggplot(data, aes(x = Age, y = Abundance)) +
+    geom_point(color = "black", alpha = 0.6) +
+    geom_line(data = df_pred, aes(x, y), color = brewer.pal(7, "Dark2")[1], size = 1) +
+    labs(
+      title = "",
+      subtitle = paste(df_name),
+      x = "Age",
+      y = "Abundance"
+    ) +
+    theme_bw() +
+    theme(panel.grid.major = element_line(color = "white"))
+  
+  assign(plot_name, plot, envir = .GlobalEnv)
+  
+  return(list(outablePo = outablePo, outableZ = outableZ))
+}
+```
+
+### Fit M0
+```{r}
+# Use the function to fit all models together
+results_all_M0 <- bind_rows(
+  fit_M0_model_M0(Str1_06),
+  fit_M0_model_M0(Str2_06)
+)
+```
+
+### Get P, z results and estimate Ptot
+```{r}
+# Filter and format Po results for Eastern stratum (Str1)
+Str1_resultsPo <- results_all_M0$outablePo %>% 
+  filter(grepl("^Str1_", dataset)) %>% 
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+gt(Str1_resultsPo)
+
+# Filter and format Po results for Western stratum (Str2)
+Str2_resultsPo <- results_all_M0$outablePo %>% 
+  filter(grepl("^Str2_", dataset)) %>% 
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+gt(Str2_resultsPo)
+
+# Filter and format Z results for Eastern stratum (Str1)
+Str1_resultsZ <- results_all_M0$outableZ %>% 
+  filter(grepl("^Str1_", dataset)) %>% 
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+gt(Str1_resultsZ)
+
+# Filter and format Z results for Western stratum (Str2)
+Str2_resultsZ <- results_all_M0$outableZ %>% 
+  filter(grepl("^Str2_", dataset)) %>% 
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+gt(Str2_resultsZ)
+
+# Estimate Ptot for Eastern stratum (Str1)
+Str1_resultsPtot <- tibble(
+  dataset   = Str1_resultsPo$dataset,
+  parameter = "Ptot",
+  estimate  = Str1_resultsPo$estimate * area_Str1,
+  se        = NA,
+  ci_lower  = Str1_resultsPo$ci_lower * area_Str1,
+  ci_upper  = Str1_resultsPo$ci_upper * area_Str1,
+  CV        = Str1_resultsPo$CV,
+  model     = Str1_resultsPo$model
+) %>%
+  mutate(se = estimate * CV)
+
+# Estimate Ptot for Western stratum (Str2)
+Str2_resultsPtot <- tibble(
+  dataset   = Str2_resultsPo$dataset,
+  parameter = "Ptot",
+  estimate  = Str2_resultsPo$estimate * area_Str2,
+  se        = NA,
+  ci_lower  = Str2_resultsPo$ci_lower * area_Str2,
+  ci_upper  = Str2_resultsPo$ci_upper * area_Str2,
+  CV        = Str2_resultsPo$CV,
+  model     = Str2_resultsPo$model
+) %>%
+  mutate(se = estimate * CV)
+```
+
+### Summary plots
+```{r}
+# Eastern stratum Po plot
+plot_Po_Str1 <- ggplot() +
+  geom_point(data = Str1_resultsPo,
+             aes(y = estimate, x = dataset, col = model),
+             size = 2) +
+  geom_errorbar(data = Str1_resultsPo, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model),
+                width = 0.2, linewidth = 1) +
+   theme_bw() +
+   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+   ylab(expression(P[0] ~ (eggs ~ m^-2 ~ day^-1))) +
+   xlab("") +
+   scale_fill_manual(name = "Model", values = brewer.pal(1, "Set1"))
+
+# Western stratum Po plot
+plot_Po_Str2 <- ggplot() +
+  geom_point(data = Str2_resultsPo,
+             aes(y = estimate, x = dataset, col = model),
+             size = 2) +
+  geom_errorbar(data = Str2_resultsPo, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2, linewidth = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[0] ~ (eggs ~ m^-2 ~ day^-1))) +
+  xlab("") +
+  scale_fill_manual(name = "Model", values = brewer.pal(1, "Set1"))
+
+# Eastern stratum Z plot
+plot_z_Str1 <- ggplot() +
+  geom_point(data = Str1_resultsZ,
+             aes(y = estimate, x = dataset, col = model), 
+             size = 2) +
+  geom_errorbar(data = Str1_resultsZ,
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model),
+                width = 0.2, linewidth = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(Z ~ (day^-1))) +
+  xlab("") +
+  scale_fill_manual(name = "Model", values = brewer.pal(1, "Set1"))
+
+# Western stratum Z plot
+plot_z_Str2 <- ggplot() +
+  geom_point(data = Str2_resultsZ, 
+             aes(y = estimate, x = dataset, col = model),
+             size = 2) +
+  geom_errorbar(data = Str2_resultsZ, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2, linewidth = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(Z ~ (day^-1))) +
+  xlab("") +
+  scale_fill_manual(name = "Model", values = brewer.pal(1, "Set1"))
+
+# Eastern stratum Ptot plot
+plot_Ptot_Str1 <- ggplot() +
+  geom_point(data = Str1_resultsPtot, 
+             aes(y = estimate / 10^11, x = dataset, col = model),
+             size = 2) +
+  geom_errorbar(data = Str1_resultsPtot,
+                aes(x = dataset, ymin = ci_lower / 10^11, ymax = ci_upper / 10^11, color = model),
+                width = 0.2, linewidth = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[tot] ~ (eggs ~ day^-1) ~ x10^11)) +
+  xlab("") +
+  scale_fill_manual(name = "Model", values = brewer.pal(1, "Set1"))
+
+# Western stratum Ptot plot
+plot_Ptot_Str2 <- ggplot() +
+  geom_point(data = Str2_resultsPtot, 
+             aes(y = estimate / 10^11, x = dataset, col = model), 
+             size = 2) +
+  geom_errorbar(data = Str2_resultsPtot, 
+                aes(x = dataset, ymin = ci_lower / 10^11, ymax = ci_upper / 10^11, color = model), 
+                width = 0.2, linewidth = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[tot] ~ (eggs ~ day^-1) ~ x10^11)) +
+  xlab("") +
+  scale_fill_manual(name = "Model", values = brewer.pal(1, "Set1"))
+
+
+
+# Combine plots into a grid layout
+Summary_Plots <- plot_grid(
+  plot_Po_Str1, plot_Po_Str2,
+  plot_z_Str1, plot_z_Str2,
+  plot_Ptot_Str1, plot_Ptot_Str2,
+  ncol = 2)
+print(Summary_Plots)
+```
+
+### Visualize Fits 
+```{r}
+#Plots of fitted models
+Ploted_fits_Str1<- print(plot_grid(plot_M0_Str1_06))
+Ploted_fits_Str2<- print(plot_grid(plot_M0_Str2_06))
+```
+
+### QQ and Residual
+```{r}
+Residuals_plots <- function(data, model, model_name) {
+  df_name <- deparse(substitute(data))
+  res_plot_name <- paste0("res_plot_", model_name, df_name)
+  res_qq_name <- paste0("res_qq_", model_name, df_name)
+  
+  data <- data %>% filter(!is.na(Abundance), !is.na(w_sn))
+  year <- sub(".*_(\\d{2}).*", "\\1", df_name)
+  year <- paste0("20", year)
+  stratum <- case_when(
+    grepl("^Str1", df_name) ~ "Eastern stratum",
+    grepl("^Str2", df_name) ~ "Western stratum",
+    TRUE ~ ""
+  )
+#Residual  
+ df_res <- data.frame(
+    Age = data$Age,
+    Predicted = predict(model, newdata = data.frame(Age = data$Age)),
+    Observed = data$Abundance
+  ) %>% mutate(Residual = (residuals(model)) / summary(model)$sigma)
+  
+# Pearson Cor
+  r_val <- cor(df_res$Predicted, df_res$Observed, use =  "complete.obs",method = "pearson")
+  
+# Residual vs Fitted plot
+p_obs_pred <- ggplot(df_res, aes(x = Predicted, y = Observed)) +
+    geom_point(alpha = 0.6, color = brewer.pal(7, "Dark2")[1]) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    labs(
+      x = "",
+      y = "Observed",
+      subtitle = paste(model_name)
+    ) +
+    annotate(
+      "text",
+      x = -Inf,
+      y = Inf,
+      label = sprintf("r = %.3f", r_val),
+      hjust = -0.1,
+      vjust = 1.1,
+      size = 4, color = "red"
+    ) +
+    theme_bw() +
+    theme(plot.title = element_text(size = 11),plot.margin = margin(t = 0.2, r = 1, b = 0, l = 1))
+  
+  p_res_fit <- ggplot(df_res, aes(x = Predicted, y = Residual)) +
+    geom_point(alpha = 0.6, color = brewer.pal(7, "Dark2")[1]) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    labs(
+      x = "",
+      y = "Residuals",
+      subtitle = ""
+    ) +
+    theme_bw() +
+    theme(plot.margin = margin(t = 0.2, r = 1, b = 0, l = 1))
+  
+  p_qq <- ggplot(df_res, aes(sample = Residual)) +
+    stat_qq(color = brewer.pal(7, "Dark2")[1]) +
+    stat_qq_line(linetype = "dashed", color = "red") +
+    labs(
+      x = "",
+      y = "Sample Q",
+      subtitle = ""
+    ) + 
+    theme_bw() +
+    theme(plot.margin = margin(t = 0.2, r = 1, b = 0, l = 1))
+  
+  res_plots <- plot_grid(p_obs_pred, p_res_fit, p_qq, ncol = 3)
+  assign(res_plot_name, res_plots, envir = .GlobalEnv)
+  assign(res_qq_name, p_qq, envir = .GlobalEnv)
+}
+
+Residuals_plots(Str1_06, model_M0Str1_06, "M0")
+res_plot_M0Str1_06
+res_qq_M0Str1_06
+
+Residuals_plots(Str2_06, model_M0Str2_06, "M0")
+res_plot_M0Str2_06
+res_qq_M0Str2_06
+```
+
+# Model 1: GLM with NB2 with OFFSET(Ri) - without spatial autocorrelation
+
+Let's move to GLM NB2.
+I have tested the results from `glmmTMB`, `sdmTMB`, and `glm.nb` from `MASS` — all give the exact same output.
+
+### Write M1 function
+```{r}
+fit_glm_NB_M1 <- function(data,plot_basic) {
+
+# Get data frame name
+df_name <- deparse(substitute(data))
+model_name <- paste0("model_M1", df_name)
+Survey <- as.character(data$Survey[1])
+
+data <- data %>% filter(!is.na(Abundance))
+data <- data %>% filter(!is.na(w_sn))
+Year <- as.character(data$Year[1])
+
+# Build dynamic object names
+  plot_name  <- paste0("plot_M1_", df_name)
+  plot_log_name  <- paste0("plot_log_M1_", df_name)
+  dispersion_name  <- paste0("dispersion_M1_", df_name)
+
+  P_est_name <- paste0("P_est_M1_", df_name)
+  z_est_name <- paste0("z_est_M1_", df_name)
+  
+  P_se_name  <- paste0("P_se_M1_", df_name)
+  z_se_name  <- paste0("z_se_M1_", df_name)
+  
+  P_ci_name  <- paste0("P_ci_M1_", df_name)
+  z_ci_name  <- paste0("z_ci_M1_", df_name)
+  
+# Fit model
+model1 <- sdmTMB(
+  Ni ~ 1 + (Age),
+  data = data,
+  offset= log(data$Ri), 
+  family = nbinom2(link = "log"),
+  weights = data$w_sn,
+  spatial = "off")  
+
+assign(model_name, model1, envir = .GlobalEnv)
+  
+#Summary/diagnostics
+summary(model1)
+sanity(model1)
+  
+params <-tidy(model1, conf.int = TRUE)
+tidy(model1, effects = "ran_par", conf.int = TRUE)
+
+# Extract param
+ P_est <- exp(params$estimate[1]) 
+ z_est <- -(params$estimate[2]) 
+ 
+# SE
+  P_se_log <-  params$std.error[1]; 
+  z_se <- params$std.error[2];
+  
+# CI 
+  P_ci <- NA;  
+  z_ci <-  c(-params$conf.high[2], -params$conf.low[2]) 
+  
+# Compute transformed estimates
+#LogP0 
+CV_P <- sqrt(exp(P_se_log^2) - 1)
+P_se <- P_est * CV_P
+P_ci_lower <- exp(params$conf.low[1])  
+P_ci_upper <- exp(params$conf.high[1])
+
+outablePo <- data.frame(
+   dataset       =  Survey,
+   parameter     = c("P"),
+   estimate_log  = params$estimate[1], 
+   estimate      = c(P_est),       # Unlog
+   se            = c(P_se) ,       #se of the estimated model,
+   ci_lower      = c(P_ci_lower),
+   ci_upper      = c(P_ci_upper),
+   CV            = c(CV_P),       
+   model         = "M1",
+   stringsAsFactors = FALSE) 
+
+outableZ <- data.frame(
+    dataset   = c(Survey),
+    parameter = "z",
+    estimate  = c(z_est),
+    se        = c(z_se),
+    ci_lower  = c(z_ci[1]), #It haves been reversed because z insted of -z is modeld
+    ci_upper  = c(z_ci[2]),
+    CV        = c(z_se/z_est),
+    model     = "M1",
+    stringsAsFactors = FALSE)
+
+
+dispersion <-model1$sd_report$value["phi"]%>% as.numeric()
+assign(dispersion_name, dispersion, envir = .GlobalEnv)
+
+#Generate predictions for plotting
+ # To predict we need an offsett so we will just predict in the original data
+  y_pred <- predict(model1, newdata = data.frame(Age = data$Age),se_fit = TRUE, re_form = NA) 
+  
+  #offset = log(data$Ri)) # unlog the prediction
+  df_pred <- data.frame(x = data$Age, y = exp(y_pred$est),
+                        ymin = exp((y_pred$est - 1.96 * (y_pred$est_se))),
+                        ymax = exp((y_pred$est + 1.96 * (y_pred$est_se)))) #If i want to plot te CI in the model 
+# Plot
+  plot <- 
+     plot_basic +
+   geom_line(data = df_pred, aes(x, y), color = brewer.pal(7, "Dark2")[2], size = 1) +
+   labs(
+      title = "",
+      subtitle = paste(df_name),
+      x = "Age",
+      y = "Abundance") +
+    theme_bw() +
+        theme(panel.grid.major = element_line(color = "white"))
+  
+assign(plot_name, plot, envir = .GlobalEnv) 
+return(list(outablePo= outablePo, outableZ=outableZ))
+}
+```
+
+### Fit M1
+```{r}
+results_all_M1 <- bind_rows(
+  fit_glm_NB_M1(Str1_06, plot_M0_Str1_06),     
+  fit_glm_NB_M1(Str2_06, plot_M0_Str2_06))
+```
+
+### Get P,z results and estimate Ptot
+```{r}
+outablePo_temp_Str1<- results_all_M1$outablePo %>% filter(grepl("^Str1_",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+outablePo_temp_Str1 <- outablePo_temp_Str1 %>% select (-estimate_log)
+Str1_resultsPo <- rbind(Str1_resultsPo,outablePo_temp_Str1)
+gt(Str1_resultsPo)
+
+outablePo_temp_Str2<- results_all_M1$outablePo %>% filter(grepl("^Str2",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+outablePo_temp_Str2 <- outablePo_temp_Str2 %>% select (-estimate_log)
+Str2_resultsPo <- rbind(Str2_resultsPo,outablePo_temp_Str2)
+gt(Str2_resultsPo)
+
+outableZ_temp_Str1 <- results_all_M1$outableZ %>% filter(grepl("^Str1_",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+Str1_resultsZ <- rbind(Str1_resultsZ,outableZ_temp_Str1)
+gt(Str1_resultsZ)
+
+outableZ_temp_Str2 <- results_all_M1$outableZ %>% filter(grepl("^Str2_",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+Str2_resultsZ <- rbind(Str2_resultsZ,outableZ_temp_Str2)
+gt(Str2_resultsZ)
+
+
+Str1_resultsPtot_temp <- tibble(
+  dataset   = outablePo_temp_Str1$dataset,
+  parameter = "Ptot",
+  estimate  = outablePo_temp_Str1$estimate * area_Str1,
+  se        = NA,
+  ci_lower  = outablePo_temp_Str1$ci_lower * area_Str1,
+  ci_upper  = outablePo_temp_Str1$ci_upper * area_Str1,
+  CV        = outablePo_temp_Str1$CV,
+  model     = outablePo_temp_Str1$model
+) %>%
+  mutate(se = estimate * CV)
+
+Str1_resultsPtot <- rbind(Str1_resultsPtot,Str1_resultsPtot_temp)
+
+Str2_resultsPtot_temp <- tibble(
+  dataset   = outablePo_temp_Str2$dataset,
+  parameter = "Ptot",
+  estimate  = outablePo_temp_Str2$estimate * area_Str2,
+  se        = NA,
+  ci_lower  = outablePo_temp_Str2$ci_lower * area_Str2,
+  ci_upper  = outablePo_temp_Str2$ci_upper * area_Str2,
+  CV        = outablePo_temp_Str2$CV,
+  model     = outablePo_temp_Str2$model
+) %>%
+  mutate(se = estimate * CV)
+
+Str2_resultsPtot <- rbind(Str2_resultsPtot,Str2_resultsPtot_temp)
+```
+
+### Summary plots
+```{r}
+# Eastern stratum Po plot
+plot_Po_Str1 <- ggplot() +
+  geom_point(data = Str1_resultsPo, 
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str1_resultsPo, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model),
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +  
+  theme_bw() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[0] ~ (eggs ~ m^-2 ~ day^-1))) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+
+# Western stratum Po plot
+plot_Po_Str2 <-ggplot() +
+  geom_point(data = Str2_resultsPo, 
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str2_resultsPo, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +  
+  theme_bw() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[0] ~ (eggs ~ m^-2 ~ day^-1))) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+# Eastern stratum Z plot
+plot_z_Str1 <-
+ggplot() +
+  geom_point(data = Str1_resultsZ, 
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str1_resultsZ, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +  
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(Z ~ (day^-1))) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+# Western stratum Z plot
+plot_z_Str2 <-
+ggplot() +
+  geom_point(data = Str2_resultsZ,
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str2_resultsZ, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +  
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(Z ~ (day^-1))) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+# Eastern stratum Ptot plot
+plot_Ptot_Str1 <-ggplot() +
+  geom_point(data = Str1_resultsPtot, 
+             aes(y = estimate / 10^11, x = dataset, col = model), 
+             size = 2, position =position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str1_resultsPtot, 
+                aes(x = dataset, ymin = ci_lower / 10^11, ymax = ci_upper / 10^11, color = model),
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +   
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[tot] ~ (eggs ~ day^-1) ~ x10^11)) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+# Western stratum Ptot plot
+plot_Ptot_Str2 <-ggplot() +
+  geom_point(data = Str2_resultsPtot, 
+             aes(y = estimate / 10^11, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str2_resultsPtot, 
+                aes(x = dataset, ymin = ci_lower / 10^11, ymax = ci_upper / 10^11, color = model),
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +   
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[tot] ~ (eggs ~ day^-1) ~ x10^11)) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+Summary_Plots <-  
+  print(plot_grid(
+    plot_Po_Str1, plot_Po_Str2,
+    plot_z_Str1, plot_z_Str2, 
+    plot_Ptot_Str1, plot_Ptot_Str2,
+    ncol = 2))
+```
+
+### Visualize Fits 
+```{r}
+#Plots of fitted models
+Ploted_fits_Str1<- print(plot_grid(plot_M1_Str1_06))
+Ploted_fits_Str2<- print(plot_grid(plot_M1_Str2_06))
+```
+
+### QQ and Residual
+```{r}
+Residuals_plots<- function(data,model,model_name){
+    df_name <- deparse(substitute(data))
+    res_plot_name  <- paste0("res_plot_",model_name,df_name)
+    res_qq_name  <- paste0("res_qq_",model_name,df_name)
+    data <- data %>% filter(!is.na(Abundance), !is.na(w_sn))
+    year <- sub(".*_(\\d{2}).*", "\\1", df_name) ;year <- paste0("20", year)
+   
+ # Determine stratum
+ stratum <- case_when(
+  grepl("^Str1", df_name) ~ "Eastern stratum",
+  grepl("^Str2", df_name) ~ "Western stratum",
+  TRUE ~ "")
+
+# Generate prediction
+df_res <- data.frame(
+  Age = data$Age,
+  Predicted = exp((predict(model, newdata = data.frame(Age = data$Age)))$est), # Unlog
+  Observed= data$Abundance) %>% mutate (Residual= residuals(model,type ="mle-mvn"))
+
+#Pearson Cor 
+r_val <- cor(df_res$Predicted, df_res$Observed, use = "complete.obs",method = "pearson")
+
+# Residual vs Fitted plot
+p_obs_pred <- ggplot(df_res, aes(x = Predicted, y = Observed)) +
+  geom_point(alpha = 0.6,color=brewer.pal(7, "Dark2")[2]) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    x = "",
+    y = "Observed",
+    subtitle = paste(model_name) )+
+  annotate(
+  "text",
+  x = -Inf,
+  y = Inf,
+  label = sprintf("r = %.3f", r_val),
+  hjust = -0.1,
+  vjust = 1.1,
+  size =4, color="red") +
+  theme_bw() +
+  theme(plot.margin = margin(t=0,r = 1,b =0,l = 1))
+   
+p_res_fit <- ggplot(df_res, aes(x = Predicted, y = Residual)) +
+    geom_point(alpha = 0.6,color=brewer.pal(7, "Dark2")[2]) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    theme_bw() +
+    labs(
+      x = "",
+      y = "Residuals",
+      subtitle="") +
+    theme(plot.margin = margin(t=0,r = 1,b =0,l = 1))
+
+
+p_qq <- ggplot(df_res, aes(sample = Residual)) +
+    stat_qq(color=brewer.pal(7, "Dark2")[2]) +
+    stat_qq_line(linetype = "dashed", color = "red") +
+    theme_bw() +
+    labs(
+      x = "",
+      y = "Sample Q",
+      subtitle="") +
+    theme(plot.margin = margin(t=0,r = 1,b =0,l = 1))
+
+
+res_plots<- plot_grid(p_obs_pred,p_res_fit,p_qq, ncol=3)
+assign(res_plot_name, res_plots, envir = .GlobalEnv)
+assign(res_qq_name, p_qq, envir = .GlobalEnv)  
+}
+
+Residuals_plots(Str1_06,model_M1Str1_06, "M1") ; res_plot_M1Str1_06 ;res_qq_M1Str1_06
+Residuals_plots(Str2_06,model_M1Str2_06, "M1") ; res_plot_M1Str2_06 ;res_qq_M1Str2_06
+
+Residuals_Str1_06<- print(plot_grid(res_plot_M0Str1_06,res_plot_M1Str1_06, nrow=2))
+Residuals_Str2_06<- print(plot_grid(res_plot_M0Str2_06,res_plot_M1Str2_06, nrow=2))
+```
+
+### DHARMa tests
+```{r}
+set.seed(123)
+Residuals_test <- data.frame(
+  Model = character(),
+  Uniformity = character(),
+  Uniformity_p = numeric(),
+  Dispersion = character(),
+  Dispersion_p = numeric(),
+  Quantile = character(),
+  Quantile_p = numeric(),
+  ZeroInfl = character(),
+  ZeroInfl_p = numeric(),
+  SpatialAut = character(),
+  SpatialAut_p = numeric()
+)
+
+resid_Chek <- function(model, data, a = 0.05, model_name = NULL) {
+  
+df_name <- deparse(substitute(data))
+model_name <- paste0("model_M1", df_name)
+  
+# Clean data
+data <- data %>% filter(!is.na(Abundance), !is.na(w_sn))
+
+# Simulate and calculate residuals
+s_fit <- simulate(model, nsim = 500, type = "mle-mvn")
+r_fit <- dharma_residuals(s_fit, model, return_DHARMa = TRUE)
+  
+# Run DHARMa tests
+res_tests <- DHARMa::testResiduals(r_fit, plot = TRUE) 
+q_test   <- DHARMa::testQuantiles(r_fit)
+zi_test  <- DHARMa::testZeroInflation(r_fit)
+
+# For the spatial autocorrelation 
+simulationOutputS <- recalculateResiduals(
+    r_fit,
+    group = paste(data$X, data$Y),
+    aggregateBy = mean)
+  
+sp_test <- DHARMa::testSpatialAutocorrelation(
+   simulationOutputS,
+   x = unique(data$X),
+   y = unique(data$Y)
+ )
+  
+# Decide pass/fail
+ un_re  <- ifelse(res_tests$uniformity$p.value < a, "Fail", "Pass")
+ dis_re <- ifelse(res_tests$dispersion$p.value < a, "Fail", "Pass")
+ q_res  <- ifelse(q_test$p.value < a, "Fail", "Pass")
+ zi_res <- ifelse(zi_test$p.value < a, "Fail", "Pass")
+ sp_res <- ifelse(sp_test$p.value < a, "Fail", "Pass")
+
+# Add results to global table
+new_row <- data.frame(
+  Model = paste(model_name),
+  Uniformity = un_re,
+  Uniformity_p = round(res_tests$uniformity$p.value, 4),
+  Dispersion = dis_re,
+  Dispersion_p = round(res_tests$dispersion$p.value, 4),
+  Quantile = q_res,
+  Quantile_p = round(q_test$p.value, 4),
+  ZeroInfl = zi_res,
+  ZeroInfl_p = round(zi_test$p.value, 4),
+  SpatialAuto = sp_res,
+  SpatialAuto_p = round(sp_test$p.value, 4)
+  )
+  
+assign("Residuals_test", rbind(get("Residuals_test", envir = .GlobalEnv), new_row), envir =.GlobalEnv)
+}
+
+resid_Chek(model_M1Str1_06, Str1_06)
+resid_Chek(model_M1Str2_06, Str2_06)
+
+gt(Residuals_test, caption = "Residuals Test")
+Residuals_test_M1 <- Residuals_test
+Residuals_test_M1
+
+# Do a summary 
+# Select only the test columns
+test_cols <- c("Uniformity", "Dispersion", "Quantile", "ZeroInfl", "SpatialAuto")
+
+# Function to count Pass
+count_pass <- function(x) sum(x == "Pass")
+
+# Create summary
+summary_table <- data.frame(
+  Test = test_cols,
+  Pass = sapply(Residuals_test[test_cols], count_pass),
+  Total = nrow(Residuals_test)
+)
+
+# Add Pass Rate as percentage
+summary_table$PassRate <- round(summary_table$Pass / summary_table$Total * 100, 1)
+
+# View the summary table
+print(summary_table)
+Residuals_test_M1_sum <- summary_table
+```
+
+
+# Model 2: GLM with tweedie without spatial autocorralation
+Let's move to GLM Tweedie
+
+### Write M2 function
+```{r}
+fit_glm_TW_M2 <- function(data,plot_basic) {
+
+# Get data frame name
+df_name <- deparse(substitute(data))
+model_name <- paste0("model_M2", df_name)
+Survey <- as.character(data$Survey[1])
+dispersion_name  <- paste0("dispersion_M2_", df_name)
+
+data <- data %>% filter(!is.na(Abundance))
+data <- data %>% filter(!is.na(w_sn))
+Year <- as.character(data$Year[1])
+
+# Build dynamic object names
+  plot_name  <- paste0("plot_M2_", df_name)
+  plot_log_name  <- paste0("plot_log_M2_", df_name)
+
+  P_est_name <- paste0("P_est_M2_", df_name)
+  z_est_name <- paste0("z_est_M2_", df_name)
+  
+  P_se_name  <- paste0("P_se_M2_", df_name)
+  z_se_name  <- paste0("z_se_M2_", df_name)
+  
+  P_ci_name  <- paste0("P_ci_M2_", df_name)
+  z_ci_name  <- paste0("z_ci_M2_", df_name)
+  
+# Fit model
+model2 <- sdmTMB(
+  Abundance ~ 1 + (Age),
+  data = data,
+  family = tweedie(link = "log"),
+  weights = data$w_sn,
+  spatial = "off")  
+
+assign(model_name, model2, envir = .GlobalEnv)
+ 
+#Summary/diagnostics
+summary(model2)
+sanity(model2)
+  
+params <-tidy(model2, conf.int = TRUE)
+tidy(model2, effects = "ran_par", conf.int = TRUE)
+
+# Extract params
+ P_est <- exp(params$estimate[1]) 
+ z_est <- -(params$estimate[2]) 
+  
+# SEs
+  P_se_log <-  params$std.error[1]
+  z_se <- params$std.error[2]
+  
+# CIs form tidy
+  P_ci <- NA
+  z_ci <-  c(-params$conf.high[2], -params$conf.low[2])
+  
+# Compute transformed estimates
+ #LogP0 
+CV_P <- sqrt(exp(P_se_log^2) - 1)
+P_se <- P_est * CV_P
+P_ci_lower <- exp(params$conf.low[1]) 
+P_ci_upper <- exp(params$conf.high[1])
+
+outablePo <- data.frame(
+   dataset       =  Survey,
+   parameter     = c("P"),
+   estimate_log  = params$estimate[1], 
+   estimate      = c(P_est),       # Unlog
+   se            = c(P_se) ,       #se of the estimated model,
+   ci_lower      = c(P_ci_lower),
+   ci_upper      = c(P_ci_upper),
+   CV            = c(CV_P),        
+   model         = "M2",
+   stringsAsFactors = FALSE) 
+
+outableZ <- data.frame(
+    dataset   = c(Survey),
+    parameter = "z",
+    estimate  = c(z_est),
+    se        = c(z_se),
+    ci_lower  = c(z_ci[1]), #It haves been reversed because z insted of -z is modeld
+    ci_upper  = c(z_ci[2]),
+    CV        = c(z_se/z_est),
+    model     = "M2",
+    stringsAsFactors = FALSE)
+
+
+dispersion <-model2$sd_report$value["phi"]%>% as.numeric()
+assign(dispersion_name, dispersion, envir = .GlobalEnv)
+
+#Generate predictions for plotting
+  x_new <- seq(min(data$Age, na.rm = TRUE),
+               max(data$Age, na.rm = TRUE),
+               length.out = 100)
+  y_pred <- predict(model2, newdata = data.frame(Age = x_new),se_fit = TRUE, re_form = NA) # unlog the prediction
+  df_pred <- data.frame(x = x_new, y = exp(y_pred$est),
+                        ymin = exp((y_pred$est - 1.96 * (y_pred$est_se))),
+                        ymax = exp((y_pred$est + 1.96 * (y_pred$est_se)))) 
+  
+# Plot
+  plot <- 
+     plot_basic +
+   geom_line(data = df_pred, aes(x, y), color = brewer.pal(7, "Dark2")[3], size = 1) +
+   labs(
+      title = "",
+      subtitle = paste(df_name),
+      x = "Age",
+      y = "Abundance"
+    ) +
+    theme_bw() +
+    theme(panel.grid.major = element_line(color = "white"))
+  
+assign(plot_name, plot, envir = .GlobalEnv) 
+
+return(list(outablePo= outablePo, outableZ=outableZ))
+}
+```
+
+### Fit M2
+```{r}
+results_all_M2 <- bind_rows(
+  fit_glm_TW_M2(Str1_06,plot_M1_Str1_06),     
+  fit_glm_TW_M2(Str2_06,plot_M1_Str2_06))
+```
+
+### Get P,z results and estimate Ptot
+```{r}
+outablePo_temp_Str1<- results_all_M2$outablePo %>% filter(grepl("^Str1_",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+outablePo_temp_Str1 <- outablePo_temp_Str1 %>% select (-estimate_log)
+Str1_resultsPo <- rbind(Str1_resultsPo,outablePo_temp_Str1)
+gt(Str1_resultsPo)
+
+outablePo_temp_Str2<- results_all_M2$outablePo %>% filter(grepl("^Str2",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+outablePo_temp_Str2 <- outablePo_temp_Str2 %>% select (-estimate_log)
+Str2_resultsPo <- rbind(Str2_resultsPo,outablePo_temp_Str2)
+gt(Str2_resultsPo)
+
+outableZ_temp_Str1 <- results_all_M2$outableZ %>% filter(grepl("^Str1_",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+Str1_resultsZ <- rbind(Str1_resultsZ,outableZ_temp_Str1)
+gt(Str1_resultsZ)
+
+outableZ_temp_Str2 <- results_all_M2$outableZ %>% filter(grepl("^Str2_",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+Str2_resultsZ <- rbind(Str2_resultsZ,outableZ_temp_Str2)
+gt(Str2_resultsZ)
+
+Str1_resultsPtot_temp <- tibble(
+  dataset   = outablePo_temp_Str1$dataset,
+  parameter = "Ptot",
+  estimate  = outablePo_temp_Str1$estimate * area_Str1,
+  se        = NA,
+  ci_lower  = outablePo_temp_Str1$ci_lower * area_Str1,
+  ci_upper  = outablePo_temp_Str1$ci_upper * area_Str1,
+  CV        = outablePo_temp_Str1$CV,
+  model     = outablePo_temp_Str1$model
+) %>%
+  mutate(se = estimate * CV)
+
+Str1_resultsPtot <- rbind(Str1_resultsPtot,Str1_resultsPtot_temp)
+
+Str2_resultsPtot_temp <- tibble(
+  dataset   = outablePo_temp_Str2$dataset,
+  parameter = "Ptot",
+  estimate  = outablePo_temp_Str2$estimate * area_Str2,
+  se        = NA,
+  ci_lower  = outablePo_temp_Str2$ci_lower * area_Str2,
+  ci_upper  = outablePo_temp_Str2$ci_upper * area_Str2,
+  CV        = outablePo_temp_Str2$CV,
+  model     = outablePo_temp_Str2$model
+) %>%
+  mutate(se = estimate * CV)
+
+Str2_resultsPtot <- rbind(Str2_resultsPtot,Str2_resultsPtot_temp)
+```
+
+### Summary plots
+```{r}
+# Eastern stratum Po plot
+plot_Po_Str1 <- ggplot() +
+  geom_point(data = Str1_resultsPo, 
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str1_resultsPo, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model),
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +  
+  theme_bw() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[0] ~ (eggs ~ m^-2 ~ day^-1))) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+
+# Western stratum Po plot
+plot_Po_Str2 <-ggplot() +
+  geom_point(data = Str2_resultsPo, 
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str2_resultsPo, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +  
+  theme_bw() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[0] ~ (eggs ~ m^-2 ~ day^-1))) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+# Eastern stratum Z plot
+plot_z_Str1 <-
+ggplot() +
+  geom_point(data = Str1_resultsZ, 
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str1_resultsZ, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +  
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(Z ~ (days^-1))) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+
+# Western stratum Z plot
+plot_z_Str2 <-
+ggplot() +
+  geom_point(data = Str2_resultsZ,
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str2_resultsZ, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +  
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(Z ~ (day^-1))) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+# Eastern stratum Ptot plot
+plot_Ptot_Str1 <-ggplot() +
+  geom_point(data = Str1_resultsPtot, 
+             aes(y = estimate / 10^11, x = dataset, col = model), 
+             size = 2, position =position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str1_resultsPtot, 
+                aes(x = dataset, ymin = ci_lower / 10^11, ymax = ci_upper / 10^11, color = model),
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +   
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[tot] ~ (eggs ~ day^-1) ~ x10^11)) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+# Western stratum Ptot plot
+plot_Ptot_Str2 <-ggplot() +
+  geom_point(data = Str2_resultsPtot, 
+             aes(y = estimate / 10^11, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str2_resultsPtot, 
+                aes(x = dataset, ymin = ci_lower / 10^11, ymax = ci_upper / 10^11, color = model),
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +   
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[tot] ~ (eggs ~ day^-1) ~ x10^11)) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+Summary_Plots <-  
+  print(plot_grid(
+    plot_Po_Str1, plot_Po_Str2,
+    plot_z_Str1, plot_z_Str2, 
+    plot_Ptot_Str1, plot_Ptot_Str2,
+    ncol = 2))
+```
+
+### Visualize Fitts 
+```{r}
+#Plots of fitted models
+Ploted_fits_Str1<- print(plot_grid(plot_M2_Str1_06))
+Ploted_fits_Str2<- print(plot_grid(plot_M2_Str2_06))
+```
+
+### QQ and Residual
+```{r}
+Residuals_plots<- function(data,model,model_name){
+    df_name <- deparse(substitute(data))
+    res_plot_name  <- paste0("res_plot_",model_name,df_name)
+    res_qq_name  <- paste0("res_qq_",model_name,df_name)
+    data <- data %>% filter(!is.na(Abundance), !is.na(w_sn))
+   year <- sub(".*_(\\d{2}).*", "\\1", df_name) ;year <- paste0("20", year)
+  
+ # Determine stratum
+ stratum <- case_when(
+  grepl("^Str1", df_name) ~ "Eastern stratum",
+  grepl("^Str2", df_name) ~ "Western stratum",
+  TRUE ~ ""
+)
+ 
+df_res <- data.frame(
+  Age = data$Age,
+  Predicted = exp((predict(model, newdata = data.frame(Age = data$Age)))$est), # Unlog
+  Observed= data$Abundance) %>% mutate (Residual= residuals(model,type ="mle-mvn"))
+
+#Pearson Cor  
+r_val <- cor(df_res$Predicted, df_res$Observed, use = "complete.obs",method = "pearson")
+
+# Residual vs Fitted plot
+p_obs_pred <- ggplot(df_res, aes(x = Predicted, y = Observed)) +
+  geom_point(alpha = 0.6,color=brewer.pal(7, "Dark2")[3]) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+ 
+  labs(
+    x = "",
+    y = "Observed",
+    subtitle = paste(model_name) )+
+annotate(
+  "text",
+  x = -Inf,
+  y = Inf,
+  label = sprintf("r = %.3f", r_val),
+  hjust = -0.1,
+  vjust = 1.1,
+  size =4, color="red") +
+  theme_bw() +
+  theme(plot.margin = margin(t=0,r = 1,b =0,l = 1))
+
+p_res_fit <- ggplot(df_res, aes(x = Predicted, y = Residual)) +
+    geom_point(alpha = 0.6,color=brewer.pal(7, "Dark2")[3]) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    theme_bw() +
+    labs(
+      x = "",
+      y = "Residuals", 
+      subtitle="") +
+     theme_bw() +
+     theme(plot.margin = margin(t=0,r = 1,b =0,l = 1))
+
+
+p_qq <- ggplot(df_res, aes(sample = Residual)) +
+    stat_qq(color=brewer.pal(7, "Dark2")[3]) +
+    stat_qq_line(linetype = "dashed",color = "red") +
+    theme_bw() +
+    labs(
+      x = "",
+      y = "Sample Q",
+     subtitle="") +
+    theme(plot.margin = margin(t=0,r = 1,b =0,l = 1))
+
+res_plots<- plot_grid(p_obs_pred,p_res_fit,p_qq, ncol=3)
+assign(res_plot_name, res_plots, envir = .GlobalEnv)  
+assign(res_qq_name, p_qq, envir = .GlobalEnv)  
+}
+
+Residuals_plots(Str1_06,model_M2Str1_06, "M2") ; res_plot_M2Str1_06 ;res_qq_M2Str1_06
+Residuals_plots(Str2_06,model_M2Str2_06, "M2") ; res_plot_M2Str2_06 ;res_qq_M2Str2_06
+
+Residuals_Str1_06<- print(plot_grid(res_plot_M0Str1_06,res_plot_M1Str1_06,res_plot_M2Str1_06, nrow=3))
+Residuals_Str2_06<- print(plot_grid(res_plot_M0Str2_06,res_plot_M1Str2_06,res_plot_M2Str2_06, nrow=3))
+```
+
+### DHAMR residuals 
+```{r}
+set.seed(123)
+Residuals_test <- data.frame(
+    Model = character(),
+    Uniformity = character(),
+    Uniformity_p = numeric(),
+    Dispersion = character(),
+    Dispersion_p= numeric(),
+    Quantile   = character(),
+    Quantile_p = numeric(),
+    ZeroInfl   = character(),
+    ZeroInfl_p = numeric(),
+    SpatialAut = character(),
+    SpatialAut_p= numeric())
+
+resid_Chek <- function(model, data, a = 0.05, model_name = NULL) {
+  
+  df_name <- deparse(substitute(data))
+  model_name <- paste0("model_M2", df_name)
+  
+  # Clean data
+  data <- data %>% filter(!is.na(Abundance), !is.na(w_sn))
+
+  # Simulate and calculate residuals
+  s_fit <- simulate(model, nsim = 500, type = "mle-mvn")
+  r_fit <- dharma_residuals(s_fit, model, return_DHARMa = TRUE)
+  
+  # Run DHARMa tests
+  res_tests<-DHARMa::testResiduals(r_fit,plot=T)  
+  q_test   <- DHARMa::testQuantiles(r_fit) #
+  zi_test  <- DHARMa::testZeroInflation(r_fit)
+
+# For the spatial autocorelation 
+  simulationOutputS <- recalculateResiduals(
+    r_fit,
+    group = paste(data$X, data$Y),
+    aggregateBy = mean  )
+  
+  sp_test <- DHARMa::testSpatialAutocorrelation(
+    simulationOutputS,
+    x = unique(data$X),
+    y = unique(data$Y)
+  )
+  
+  # Decide pass/fail
+  un_re  <- ifelse(res_tests$uniformity$p.value  < a, "Fail", "Pass")
+  dis_re  <- ifelse(res_tests$dispersion$p.value  < a, "Fail", "Pass")
+  q_res  <- ifelse(q_test$p.value  < a, "Fail", "Pass")
+  zi_res <- ifelse(zi_test$p.value < a, "Fail", "Pass")
+  sp_res <- ifelse(sp_test$p.value < a, "Fail", "Pass")
+  
+  # Add results to global table
+  new_row <- data.frame(
+    Model = paste(model_name),
+    Uniformity = un_re,
+    Uniformity_p = round(res_tests$uniformity$p.value,4),
+    Dispersion = dis_re,
+    Dispersion_p = round(res_tests$dispersion$p.value,4),
+    Quantile = q_res,
+    Quantile_p= round(q_test$p.value,4),
+    ZeroInfl = zi_res,
+    ZeroInfl_p= round(zi_test$p.value,4),
+    SpatialAuto = sp_res,
+    SpatialAuto_p= round(sp_test$p.value,4))
+  
+assign("Residuals_test", rbind(get("Residuals_test", envir = .GlobalEnv), new_row), envir = .GlobalEnv)
+}
+
+ resid_Chek(model_M2Str1_06,Str1_06)
+ resid_Chek(model_M2Str2_06,Str2_06)
+
+gt(Residuals_test,caption = "Residuals Test")
+Residuals_test_M2 <- Residuals_test
+
+# Do a summary 
+# Select only the test columns
+test_cols <- c("Uniformity", "Dispersion", "Quantile", "ZeroInfl", "SpatialAuto")
+
+# Function to count Pass
+count_pass <- function(x) sum(x == "Pass")
+
+# Create summary
+summary_table <- data.frame(
+  Test = test_cols,
+  Pass = sapply(Residuals_test[test_cols], count_pass),
+  Total = nrow(Residuals_test)
+)
+
+# Add Pass Rate as percentage
+summary_table$PassRate <- round(summary_table$Pass / summary_table$Total * 100, 1)
+
+# View the summary table
+print(summary_table)
+Residuals_test_M2_sum <- summary_table
+```
+
+# Some statistiscs to compaire models
+```{r}
+#Eastern stratum datasets
+data <- Str1_06 %>%filter(!is.na(Abundance), !is.na(w_sn))
+pred_M0 <- predict(model_M0Str1_06, type = "response")
+pred_M1 <- predict(model_M1Str1_06, type = "response")
+pred_M2 <- predict(model_M2Str1_06, type = "response")
+obs <- data$Abundance
+
+rmse_Str1_06_M0 <- sqrt(mean((obs-pred_M0)^2, na.rm = TRUE))
+rmse_Str1_06_M1 <- sqrt(mean((obs-pred_M1$est)^2, na.rm = TRUE))
+rmse_Str1_06_M2 <- sqrt(mean((obs-pred_M2$est)^2, na.rm = TRUE))
+cor_Str1_06_M0  <- cor(obs, pred_M0, use = "complete.obs", method = "pearson")
+cor_Str1_06_M1  <- cor(obs, pred_M1$est, use = "complete.obs", method = "pearson")
+cor_Str1_06_M2  <- cor(obs, pred_M2$est, use = "complete.obs", method = "pearson")
+
+#Western Stratum datasets
+data <- Str2_06 %>%filter(!is.na(Abundance), !is.na(w_sn))
+pred_M0 <- predict(model_M0Str2_06, type = "response")
+pred_M1 <- predict(model_M1Str2_06, type = "response")
+pred_M2 <- predict(model_M2Str2_06, type = "response")
+obs <- data$Abundance
+
+rmse_Str2_06_M0 <- sqrt(mean((obs-pred_M0)^2, na.rm = TRUE))
+rmse_Str2_06_M1 <- sqrt(mean((obs-pred_M1$est)^2, na.rm = TRUE))
+rmse_Str2_06_M2 <- sqrt(mean((obs-pred_M2$est)^2, na.rm = TRUE))
+cor_Str2_06_M0  <- cor(obs, pred_M0, use = "complete.obs", method = "pearson")
+cor_Str2_06_M1  <- cor(obs, pred_M1$est, use = "complete.obs", method = "pearson")
+cor_Str2_06_M2  <- cor(obs, pred_M2$est, use = "complete.obs", method = "pearson")
+
+#Merge
+RMSE<- tibble(dataset= c("Str1_06","Str2_06"),
+              RMSE_M0= c(rmse_Str1_06_M0,rmse_Str2_06_M0),            
+              RMSE_M1= c(rmse_Str1_06_M1,rmse_Str2_06_M2),
+              RMSE_M2= c(rmse_Str1_06_M2,rmse_Str2_06_M2),
+              COR_M0 = c(cor_Str1_06_M0,cor_Str2_06_M0),
+              COR_M1 = c(cor_Str1_06_M1,cor_Str1_06_M1),
+              COR_M2 = c(cor_Str1_06_M2,cor_Str1_06_M2))
+```
+
+# Constract the Barrier mesh  need to run the Spatial Models
+```{r}
+#  Create factions to create for the barrier meshes
+create_mesh_Str1<- function(data,PA_polygone,edge_est_km)
+{
+df_name <- deparse(substitute(data))
+mesh_name <- paste0("bspde", df_name)
+
+data <- data %>% filter(!is.na(Abundance))
+data <- data %>% filter(!is.na(w_sn))
+data.eggs <- data
+
+poly.coast <- coast # in WGS84 
+stations_sf <- st_as_sf(data.eggs, coords = c("Lon","Lat"), crs = 4326) 
+plot(stations_sf$geometry, pch=19, col=2)
+
+#Create a convex hull polygon around all stations 
+transect_poly <- st_convex_hull(st_union(stations_sf))
+
+# Buffer around the transect polygon (e.g., 0.1 degrees ~ ~10km depending on latitude)
+buff <- st_buffer(transect_poly, dist = 10000) # WGS84 degrees; or use UTM for meters
+plot(buff, col = "lightblue", border = "blue");plot(stations_sf$geometry, add = TRUE, pch = 19, col = 2)
+
+output = st_intersection(buff,poly.coast)
+plot(output,col=3)
+domain = st_difference(transect_poly,st_union(output)) 
+domain = st_sf(domain)
+
+domain_utm <- st_transform(domain, "+init=epsg:32635 +units=km")
+plot(domain_utm,col=4,axes=T);plot(data.eggs$X, data.eggs$Y, pch="+",add=T)
+
+range_est<- edge_est_km*5 
+max.edge = edge_est_km 
+bound.outer = range_est*(2/3)
+
+poly.coast <- st_make_valid(poly.coast)
+domain_utm <- st_make_valid(domain_utm)
+
+# Build high-resolution mesh
+mesh_high = inla.mesh.2d( 
+  boundary = domain_utm, 
+  loc = cbind(data.eggs$X, data.eggs$Y),
+  max.edge = c(1,5)*max.edge,
+  cutoff = max.edge/5, 
+  offset = c(max.edge, bound.outer)
+  )
+
+plot(mesh_high, lwd=0.5, axes = T); points(data.eggs$X, data.eggs$Y, col="red")
+mesh_high <- make_mesh(data.eggs, c("X", "Y"), mesh = mesh_high) 
+plot(mesh_high, lwd=0.5, axes = T); points(data.eggs$X, data.eggs$Y, col="red")
+
+# Add on the barrier mesh component
+poly.coast_utm <- st_transform(poly.coast, "+init=epsg:32635 +units=km")
+bspde <- add_barrier_mesh(
+  spde_obj = mesh_high,
+  barrier_sf = poly.coast_utm,
+  range_fraction = 0.1,
+  proj_scaling = 1,
+  plot = TRUE)
+plot(bspde, lwd=0.5); points(data.eggs$X, data.eggs$Y, col="red")
+assign(mesh_name, bspde, envir = .GlobalEnv)
+}
+
+create_mesh_Str2<- function(data,PA_polygone,edge_est_km)
+{
+df_name <- deparse(substitute(data))
+mesh_name <- paste0("bspde", df_name)
+
+data <- data %>% filter(!is.na(Abundance))
+data <- data %>% filter(!is.na(w_sn))
+data.eggs <- data
+
+poly.coast <- coast # in WGS84 
+stations_sf <- st_as_sf(data.eggs, coords = c("Lon","Lat"), crs = 4326) 
+plot(stations_sf$geometry, pch=19, col=2)
+
+#Create a convex hull polygon around all stations 
+transect_poly <- st_convex_hull(st_union(stations_sf))
+
+# Buffer around the transect polygon (e.g., 0.1 degrees ~ ~10km depending on latitude)
+buff <- st_buffer(transect_poly, dist = 10000) # WGS84 degrees; or use UTM for meters
+plot(buff, col = "lightblue", border = "blue");plot(stations_sf$geometry, add = TRUE, pch = 19, col = 2)
+
+output = st_intersection(buff,poly.coast)
+plot(output,col=3)
+domain = st_difference(transect_poly,st_union(output)) 
+domain = st_sf(domain)
+
+domain_utm <- st_transform(domain, "+init=epsg:32635 +units=km")
+plot(domain_utm,col=4,axes=T);plot(data.eggs$X, data.eggs$Y, pch="+",add=T)
+
+# Mesh characteristics 
+range_est<-  edge_est_km*5 
+max.edge =edge_est_km  
+bound.outer = range_est*(2/3)
+
+#force geometries to be valid:
+poly.coast <- st_make_valid(poly.coast)
+domain_utm <- st_make_valid(domain_utm)
+
+# Build high-resolution mesh
+mesh_high = inla.mesh.2d( 
+  boundary = domain_utm, 
+  loc = cbind(data.eggs$X, data.eggs$Y),
+  max.edge = c(1,5)*max.edge,
+  cutoff = max.edge/5, 
+  offset = c(max.edge, bound.outer)
+  )
+
+plot(mesh_high, lwd=0.5, axes = T); points(data.eggs$X, data.eggs$Y, col="red")
+mesh_high <- make_mesh(data.eggs, c("X", "Y"), mesh = mesh_high) 
+plot(mesh_high, lwd=0.5, axes = T); points(data.eggs$X, data.eggs$Y, col="red")
+
+# Add on the barrier mesh component
+poly.coast_utm <- st_transform(poly.coast, "+init=epsg:32635 +units=km")
+bspde <- add_barrier_mesh(
+  spde_obj = mesh_high,
+  barrier_sf = poly.coast_utm,
+  range_fraction = 0.1,
+  proj_scaling = 1,
+  plot = TRUE)
+
+plot(bspde, lwd=0.5); points(data.eggs$X, data.eggs$Y, col="red")
+assign(mesh_name, bspde, envir = .GlobalEnv)
+}
+
+# Crate the meshes using the optimized edge value selacted based on the prior sensitivity analyses
+create_mesh_Str1(Str1_06, PA_2006_Str1,edge_est_km=22) 
+create_mesh_Str2(Str2_06,PA_2006_Str2,edge_est_km=7)  
+``` 
+
+# Model 3: GLMM with NB and spatial autocorralation
+
+### Write M3 function 
+```{r}
+fit_glm_NBsp_M3 <- function(data,PA_polygone,bspde,plot_basic) {
+ 
+# Get data frame name
+df_name <- deparse(substitute(data))
+model_name <- paste0("model_M3", df_name)
+Survey <- as.character(data$Survey[1])
+dispersion_name  <- paste0("dispersion_M3_", df_name)
+
+data <- data %>% filter(!is.na(Abundance))
+data <- data %>% filter(!is.na(w_sn))
+Year <- as.character(data$Year[1])
+
+# Build dynamic object names
+  plot_name  <- paste0("plot_M3_", df_name)
+  plot_log_name  <- paste0("plot_log_M3_", df_name)
+  omega_name  <- paste0("omegaSD_M3_", df_name)
+  range_name  <- paste0("range_M3_", df_name)
+  dispersion_name  <- paste0("dispersion_M3_", df_name)
+
+  P_est_name <- paste0("P_est_M3_", df_name)
+  z_est_name <- paste0("z_est_M3_", df_name)
+  
+  P_se_name  <- paste0("P_se_M3_", df_name)
+  z_se_name  <- paste0("z_se_M3_", df_name)
+  
+  P_ci_name  <- paste0("P_ci_M3_", df_name)
+  z_ci_name  <- paste0("z_ci_M3_", df_name)
+  
+# Fit model
+model3 <-  sdmTMB(
+  Ni ~ 1 + (Age),
+  data = data,
+  offset= log(data$Ri), # log because we are at the logit 
+  family = nbinom2(link = "log"),
+  mesh = bspde,
+  spatial = "on")  
+
+assign(model_name, model3, envir = .GlobalEnv)
+
+#Summary
+summary(model3)
+sanity(model3)
+
+params <-tidy(model3, conf.int = TRUE)
+tidy(model3, effects = "ran_par", conf.int = TRUE)
+
+#Extract param
+ P_est <- exp(params$estimate[1]) 
+ z_est <- -(params$estimate[2]) 
+  
+#SE
+  P_se_log <-  params$std.error[1]
+  z_se <- params$std.error[2]
+  
+#CI 
+  P_ci <- NA  
+  z_ci <-  c(-params$conf.high[2], -params$conf.low[2]) 
+  
+#Spatial stracture
+ rep <- model3$tmb_obj$report()
+ sigma_O <- rep$sigma_O [1,1]
+ range<-  rep$range[1,1]
+ dispersion <-model3$sd_report$value["phi"]%>% as.numeric()
+
+assign(omega_name, sigma_O, envir = .GlobalEnv)
+assign(range_name, range, envir = .GlobalEnv)
+assign(dispersion_name, dispersion, envir = .GlobalEnv)
+
+# Compute transformed estimates
+#LogP0
+CV_P <- sqrt(exp(P_se_log^2) - 1)
+P_se <- P_est * CV_P
+P_ci_lower <- exp(params$conf.low[1]) 
+P_ci_upper <- exp(params$conf.high[1])
+
+outablePo <- data.frame(
+    dataset       =  Survey,
+    parameter     = c("P"),
+    estimate_log  = params$estimate[1], 
+    estimate      = c(P_est),       # Unlog
+    se            = c(P_se) ,       #se of the estimated model,
+    ci_lower      = c(P_ci_lower),
+    ci_upper      = c(P_ci_upper),
+    CV            = c(CV_P),        
+    model         = "M3",
+    stringsAsFactors = FALSE) 
+
+  outableZ <- data.frame(
+    dataset   = c(Survey),
+    parameter = "z",
+    estimate  = c(z_est),
+    se        = c(z_se),
+    ci_lower  = c(z_ci[1]), #It haves been reversed because z insted of -z is modeld
+    ci_upper  = c(z_ci[2]),
+    CV        = c(z_se/z_est),
+    model     = "M3",
+    stringsAsFactors = FALSE)
+
+#Predict in data points 
+# Back predict on the data:  for the  omega -and the  the plots 
+predic.grid1 <- data %>% filter(!is.na(Stage))  %>% filter(!is.na(Age))  
+predict1 <- predict(model3,newdata=predic.grid1,re_form = NA) #Turn of the spatial filed in the prediction
+
+model_prediction1 <- paste0("model_M3", df_name, "_pred1")
+assign(model_prediction1, predict1, envir = .GlobalEnv)
+
+# Plot
+  plot <- 
+     plot_basic +
+   geom_line(data = predict1, aes(x=Age, y= exp(est)), color = brewer.pal(7, "Dark2")[4], linewidth = 1) +
+   labs(
+      title = "",
+      subtitle = paste(df_name),#, ": P=", round(P_est, 3), ", z=", round(z_est, 3)),
+      x = "Age",
+      y = "Abundance" ) +
+    theme_bw() +
+    theme(panel.grid.major = element_line(color = "white"))
+  
+assign(plot_name, plot, envir = .GlobalEnv) 
+
+#For the Ptot Prediction -> index standardization
+#1. Create the extrapolation grid (PA- division)
+grid_1km <- st_make_grid(
+  PA_polygone,
+  cellsize = 1,        # 1 unit = 1 km
+  square = TRUE,
+  what = "polygons")
+
+grid_clipped <- st_intersection(grid_1km, PA_polygone)  # Do the grid only in the Positive area 
+
+plot(grid_clipped)
+centroids <- st_centroid(grid_clipped)
+centroids_df <- st_coordinates(centroids) %>%
+  as.data.frame() 
+
+centroids_m <- centroids %>% st_sf()  # ensure sf
+st_geometry(centroids_m) <- st_geometry(centroids_m) * 1000  # km -> m
+st_crs(centroids_m) <- 32635
+centroids_wgs84 <- st_transform(centroids_m, crs = 4326)
+
+lonlat_df <- st_coordinates(centroids_wgs84) %>%
+  as.data.frame() %>% dplyr::rename(Lon = X, Lat = Y)
+
+centroids_df <- bind_cols(centroids_df, lonlat_df)
+
+#This is the new prediction grid that will force the prediction index standardization 
+#log(Pij)=log(Po) + ω +  (z*t) , but z*t=0 so --> log(Pij)=log(Po) + ω (Prediction is now Ptot)
+predic.grid2<- centroids_df %>% mutate(Age=0)
+
+#Predict
+predict2 <- predict(model3,newdata=predic.grid2,return_tmb_object = TRUE) 
+model_prediction2 <- paste0("model_M3", df_name, "_pred2")
+assign(model_prediction2, predict2, envir = .GlobalEnv)
+ 
+#3.Get the index (Ptot)
+index <- get_index(predict2, area =10^6, bias_correct = TRUE)  # 10^6 for making kM1--> M1
+index <- index %>% mutate(cv = sqrt(exp(se^2) - 1))   #Since se refer to the log estimate
+
+outablelPtot <- data.frame(
+  dataset       =  Survey,
+  parameter = "Ptot",
+  estimate  = index$est, #estimate in the original scale
+  se        =  index$cv*index$est,  # re-estimate it because it was in log(abundance)
+  ci_lower  =  index$lwr,
+  ci_upper  =  index$upr,
+  CV        = index$cv,   # re-estimate it because it was in log(abundance))
+  model         = "M3",
+  stringsAsFactors = FALSE) 
+
+# Output tables
+return(list(outablePo= outablePo, outableZ=outableZ,outablelPtot=outablelPtot))
+}
+```
+
+### Fit M3
+```{r}
+results_all_M3 <- bind_rows(
+fit_glm_NBsp_M3(Str1_06,PA_2006_Str1,bspdeStr1_06,plot_M2_Str1_06),
+fit_glm_NBsp_M3(Str2_06,PA_2006_Str2,bspdeStr2_06,plot_M2_Str2_06))
+```
+
+### Get P,z results and estimate Ptot
+```{r}
+outablePo_temp_Str1<- results_all_M3$outablePo %>% filter(grepl("^Str1_",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+outablePo_temp_Str1 <- outablePo_temp_Str1 %>% select (-estimate_log)
+Str1_resultsPo <- rbind(Str1_resultsPo,outablePo_temp_Str1)
+gt(Str1_resultsPo)
+
+outablePo_temp_Str2<- results_all_M3$outablePo %>% filter(grepl("^Str2",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+outablePo_temp_Str2 <- outablePo_temp_Str2 %>% select (-estimate_log)
+Str2_resultsPo <- rbind(Str2_resultsPo,outablePo_temp_Str2)
+gt(Str2_resultsPo)
+
+outableZ_temp_Str1 <- results_all_M3$outableZ %>% filter(grepl("^Str1_",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+Str1_resultsZ <- rbind(Str1_resultsZ,outableZ_temp_Str1)
+gt(Str1_resultsZ)
+
+outableZ_temp_Str2 <- results_all_M3$outableZ %>% filter(grepl("^Str2_",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+Str2_resultsZ <- rbind(Str2_resultsZ,outableZ_temp_Str2)
+gt(Str2_resultsZ)
+
+#Plot will be prediction output 
+Str1_resultsPtot_temp <-results_all_M3$outablelPtot %>% filter(grepl("^Str1_",dataset)) 
+
+Str1_resultsPtot <- rbind(Str1_resultsPtot,Str1_resultsPtot_temp)
+gt(Str1_resultsPtot)
+
+Str2_resultsPtot_temp <-results_all_M3$outablelPtot %>% filter(grepl("^Str2_",dataset)) 
+
+Str2_resultsPtot <- rbind(Str2_resultsPtot,Str2_resultsPtot_temp)
+gt(Str2_resultsPtot)
+```
+
+### Summary plots
+```{r}
+# Eastern stratum Po plot
+plot_Po_Str1 <- ggplot() +
+  geom_point(data = Str1_resultsPo, 
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str1_resultsPo, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model),
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +  
+  theme_bw() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[0] ~ (eggs ~ m^-2 ~ day^-1))) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+
+# Western stratum Po plot
+plot_Po_Str2 <-ggplot() +
+  geom_point(data = Str2_resultsPo, 
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str2_resultsPo, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +  
+  theme_bw() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[0] ~ (eggs ~ m^-2 ~ day^-1))) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+# Eastern stratum Z plot
+plot_z_Str1 <-
+ggplot() +
+  geom_point(data = Str1_resultsZ, 
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str1_resultsZ, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +  
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(Z ~ (days^-1))) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+
+# Western stratum Z plot
+plot_z_Str2 <-
+ggplot() +
+  geom_point(data = Str2_resultsZ,
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str2_resultsZ, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +  
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(Z ~ (day^-1))) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+# Eastern stratum Ptot plot
+plot_Ptot_Str1 <-ggplot() +
+  geom_point(data = Str1_resultsPtot, 
+             aes(y = estimate / 10^11, x = dataset, col = model), 
+             size = 2, position =position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str1_resultsPtot, 
+                aes(x = dataset, ymin = ci_lower / 10^11, ymax = ci_upper / 10^11, color = model),
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +   
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[tot] ~ (eggs ~ day^-1) ~ x10^11)) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+# Western stratum Ptot plot
+plot_Ptot_Str2 <-ggplot() +
+  geom_point(data = Str2_resultsPtot, 
+             aes(y = estimate / 10^11, x = dataset, col = model),
+             size = 2, position = position_dodge(width = 0.3)) + 
+  geom_errorbar(data = Str2_resultsPtot, 
+                aes(x = dataset, ymin = ci_lower / 10^11, ymax = ci_upper / 10^11, color = model),
+                width = 0.2, linewidth = 1, position = position_dodge(width = 0.3)) +   
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[tot] ~ (eggs ~ day^-1) ~ x10^11)) + xlab("") +
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+
+Summary_Plots <-  
+  print(plot_grid(
+    plot_Po_Str1, plot_Po_Str2,
+    plot_z_Str1, plot_z_Str2, 
+    plot_Ptot_Str1, plot_Ptot_Str2,
+    ncol = 2))
+```
+
+### Visualize Fits 
+```{r}
+Ploted_fits_Str1<- print(plot_grid(plot_M3_Str1_06))
+Ploted_fits_Str2<- print(plot_grid(plot_M3_Str2_06))
+```
+
+### QQ and Residuals 
+```{r}
+Residuals_plots<- function(data,model,model_name){
+    df_name <- deparse(substitute(data))
+    res_plot_name  <- paste0("res_plot_",model_name,df_name)
+    res_qq_name  <- paste0("res_qq_",model_name,df_name)
+    data <- data %>% filter(!is.na(Abundance), !is.na(w_sn))
+    year <- sub(".*_(\\d{2}).*", "\\1", df_name) ;year <- paste0("20", year)
+   
+ # Determine stratum
+ stratum <- case_when(
+  grepl("^Str1", df_name) ~ "Eastern stratum",
+  grepl("^Str2", df_name) ~ "Western stratum",
+  TRUE ~ ""
+)
+# Generate predictions on the original Age values
+df_res <- data.frame(
+  Age = data$Age,
+  Predicted = exp((predict(model, newdata = data.frame(Age = data$Age,X=data$X,Y=data$Y)))$est), 
+  Observed= data$Abundance) %>% mutate (Residual= residuals(model,type ="mle-mvn"))
+
+#Pearson Cor coef 
+r_val <- cor(df_res$Predicted, df_res$Observed, use = "complete.obs",method = "pearson")
+
+# Residual vs Fitted plot
+p_obs_pred <- ggplot(df_res, aes(x = Predicted, y = Observed)) +
+  geom_point(alpha = 0.6,color=brewer.pal(7, "Dark2")[4]) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    x = "",
+    y = "Observed",
+    subtitle = paste(model_name) )+
+  annotate(
+   "text",
+   x = -Inf,
+   y = Inf,
+   label = sprintf("r = %.3f", r_val),
+   hjust = -0.1,
+   vjust = 1.1,
+   size =4, color="red")  + 
+ theme_bw() +
+ theme(plot.margin = margin(t=0,r=1,b=0,l=1))
+   
+p_res_fit <- ggplot(df_res, aes(x = Predicted, y = Residual)) +
+    geom_point(alpha = 0.6,color=brewer.pal(7, "Dark2")[4]) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    theme_bw() +
+    labs(
+      y = "Residuals",
+      x = "",
+      subtitle="")+ 
+   theme_bw() +
+   theme(plot.margin = margin(t =0,r = 1,b =0,l = 1))
+
+p_qq <- ggplot(df_res, aes(sample = Residual)) +
+    stat_qq(color=brewer.pal(7, "Dark2")[4]) +
+    stat_qq_line(linetype = "dashed",color = "red") +
+    theme_bw() +
+    labs(
+      x = "",
+      y = "Sample Q",
+      subtitle="") + 
+     theme(plot.margin = margin(t=0,r = 1,b =0,l = 1))
+
+res_plots<- plot_grid(p_obs_pred,p_res_fit,p_qq, ncol=3)
+
+assign(res_plot_name, res_plots, envir = .GlobalEnv) 
+assign(res_qq_name, res_plots, envir = .GlobalEnv)  
+}
+
+Residuals_plots(Str1_06,model_M3Str1_06, "M3") ; res_plot_M3Str1_06 ;res_qq_M3Str1_06
+Residuals_plots(Str2_06,model_M3Str2_06, "M3") ; res_plot_M3Str2_06 ;res_qq_M3Str2_06
+
+Residuals_Str1_06<- print(plot_grid(res_plot_M0Str1_06,res_plot_M1Str1_06,res_plot_M2Str1_06,res_plot_M3Str1_06,nrow=4))
+Residuals_Str2_06<- print(plot_grid(res_plot_M0Str2_06,res_plot_M1Str2_06,res_plot_M2Str2_06,res_plot_M3Str2_06, nrow=4))
+```
+
+### DHARMa residuals 
+```{r}
+set.seed(123) # So you get the same output in any simulation 
+
+Residuals_test <- data.frame(
+    Model = character(),
+    Uniformity = character(),
+    Uniformity_p = numeric(),
+    Dispersion = character(),
+    Dispersion_p= numeric(),
+    Quantile   = character(),
+    Quantile_p = numeric(),
+    ZeroInfl   = character(),
+    ZeroInfl_p = numeric(),
+    SpatialAut = character(),
+    SpatialAut_p= numeric())
+
+resid_Chek <- function(model, data, a = 0.05, model_name = NULL) {
+  
+df_name <- deparse(substitute(data))
+  model_name <- paste0("model_M3", df_name)
+  
+# Clean data
+  data <- data %>% filter(!is.na(Abundance), !is.na(w_sn))
+
+# Simulate and calculate residuals
+  s_fit <- simulate(model, nsim = 500, type = "mle-mvn")
+  r_fit <- dharma_residuals(s_fit, model, return_DHARMa = TRUE)
+  
+# Run DHARMa tests
+  res_tests<-DHARMa::testResiduals(r_fit,plot=T)  
+  q_test   <- DHARMa::testQuantiles(r_fit) # same as plotResiduals quantile residuals versus (ranked) fitted values. Check for homogeneity of variance-
+  zi_test  <- DHARMa::testZeroInflation(r_fit)
+
+# For the spatial autocorelation 
+simulationOutputS <- recalculateResiduals(
+    r_fit,
+    group = paste(data$X, data$Y),
+    aggregateBy = mean)
+  
+sp_test <- DHARMa::testSpatialAutocorrelation(
+    simulationOutputS,
+    x = unique(data$X),
+    y = unique(data$Y))
+  
+# Decide pass/fail
+un_re  <- ifelse(res_tests$uniformity$p.value  < a, "Fail", "Pass")
+dis_re  <- ifelse(res_tests$dispersion$p.value  < a, "Fail", "Pass")
+q_res  <- ifelse(q_test$p.value  < a, "Fail", "Pass")
+zi_res <- ifelse(zi_test$p.value < a, "Fail", "Pass")
+sp_res <- ifelse(sp_test$p.value < a, "Fail", "Pass")
+  
+# Add results to global table
+new_row <- data.frame(
+  Model = paste(model_name),
+  Uniformity = un_re,
+  Uniformity_p = round(res_tests$uniformity$p.value,4),
+  Dispersion = dis_re,
+  Dispersion_p = round(res_tests$dispersion$p.value,4),
+  Quantile = q_res,
+  Quantile_p= round(q_test$p.value,4),
+  ZeroInfl = zi_res,
+  ZeroInfl_p= round(zi_test$p.value,4),
+  SpatialAuto = sp_res,
+  SpatialAuto_p= round(sp_test$p.value,4) )
+  
+assign("Residuals_test", rbind(get("Residuals_test", envir = .GlobalEnv), new_row), envir = .GlobalEnv)
+
+}
+
+ resid_Chek(model_M3Str1_06,Str1_06)
+ resid_Chek(model_M3Str2_06,Str2_06)
+
+gt(Residuals_test,caption = "Residuals Test")
+Residuals_test_M3 <- Residuals_test
+
+# Do a summary 
+# Select only the test columns
+test_cols <- c("Uniformity", "Dispersion", "Quantile", "ZeroInfl", "SpatialAuto")
+
+# Function to count Pass
+count_pass <- function(x) sum(x == "Pass")
+
+# Create summary
+summary_table <- data.frame(
+  Test = test_cols,
+  Pass = sapply(Residuals_test[test_cols], count_pass),
+  Total = nrow(Residuals_test))
+
+# Add Pass Rate as percentage
+summary_table$PassRate <- round(summary_table$Pass / summary_table$Total * 100, 1)
+
+# View the summary table
+print(summary_table)
+Residuals_test_M3_sum <- summary_table
+```
+
+### Omegas
+```{r}
+#plot all the omegas 
+all_omega_Str1 <- c(model_M3Str1_06_pred2$data$omega_s)
+color_limits_Str1 <- c(min(all_omega_Str1, na.rm = TRUE),max(all_omega_Str1, na.rm = TRUE)) 
+
+all_omega_Str2 <- c(model_M3Str2_06_pred2$data$omega_s)
+color_limits_Str2 <- c(min(all_omega_Str2, na.rm = TRUE),max(all_omega_Str2, na.rm = TRUE)) 
+
+tile_size <- 0.015
+tile_width <- 1 / (111 * cos(25 * pi/180))  # ~0.0102°
+tile_height <- 1 / 111  # ~0.0090°
+tile_height <- tile_height * 1.15
+tile_width <- tile_width * 1.2
+
+plot_O_pub_Str1 <- function(prediction, m_code, legend = TRUE) {
+p<- ggplot() +
+   # Coastline
+  geom_tile(
+    data = prediction,
+    aes(x = Lon, y = Lat, fill = omega_s),
+    width = tile_width,  # adjust to your grid spacing
+    height = tile_height
+  ) +
+   scale_fill_gradient2(name = expression(omega[s]),
+     low = "red", mid = "white", high = "blue",
+     midpoint = 0,
+     limits = color_limits_Str1)+
+    labs(x = "Longitude", y = "Latitude", title = m_code) +
+    theme(panel.background = element_rect(fill = "gray85", color = NA))+
+    geom_sf(data = coast, fill = "gray20", col = "gray50") +
+    coord_sf(xlim = c(23.5, 26), ylim = c(39.3, 41)) +
+    scale_x_continuous(breaks = seq(23.5, 26.5, by = 1))
+  
+    if(!legend) {
+   p <- p + theme(legend.position = "none")
+  }
+    print(p)}
+  
+plot_O_pub_Str2 <- function(prediction, m_code, legend = TRUE) {
+  p<- ggplot() +
+  geom_tile(
+    data = prediction,
+    aes(x = Lon, y = Lat, fill = omega_s),
+    width = tile_width,  # adjust to your grid spacing
+    height = tile_height ) +
+  scale_fill_gradient2(name = expression(omega[s]),
+     low = "red", mid = "white", high = "blue",
+    midpoint = 0,
+    limits = color_limits_Str2) + 
+    labs(x = "Longitude", y = "Latitude", title = m_code) +
+    theme(panel.background = element_rect(fill = "gray85", color = NA))+
+    geom_sf(data = coast, fill = "gray20", col = "gray50") +
+    coord_sf(xlim = c(22.5, 25), ylim = c(38.3, 40.9))+
+    scale_x_continuous(breaks = seq(22.5, 25, by = 1))
+  
+if(!legend) {
+   p <- p + theme(legend.position = "none")
+  }
+    print(p)
+}
+
+
+#Visualize the spatial fields
+plotomega_Str1_06 <- plot_O_pub_Str1(model_M3Str1_06_pred2$data, "2006", legend = TRUE) 
+plotomega_Str2_06 <- plot_O_pub_Str2(model_M3Str2_06_pred2$data, "2006", legend = TRUE) 
+```
+
+## Model 4: GLMM with Tweedie and spatial autocorralation
+
+### Write M4 function 
+```{r}
+fit_glm_TWsp_M4 <- function(data,PA_polygone,bspde,plot_basic) {
+ 
+# Get data frame name
+df_name <- deparse(substitute(data))
+model_name <- paste0("model_M4", df_name)
+Survey <- as.character(data$Survey[1])
+
+data <- data %>% filter(!is.na(Abundance))
+data <- data %>% filter(!is.na(w_sn))
+Year <- as.character(data$Year[1])
+
+# Build dynamic object names
+  plot_name  <- paste0("plot_M4_", df_name)
+  plot_log_name  <- paste0("plot_log_M4_", df_name)
+  omega_name  <- paste0("omegaSD_M4_", df_name)
+  range_name  <- paste0("range_M4_", df_name)
+  dispersion_name  <- paste0("dispersion_M4_", df_name)
+
+  P_est_name <- paste0("P_est_M4_", df_name)
+  z_est_name <- paste0("z_est_M4_", df_name)
+  
+  P_se_name  <- paste0("P_se_M4_", df_name)
+  z_se_name  <- paste0("z_se_M4_", df_name)
+  
+  P_ci_name  <- paste0("P_ci_M4_", df_name)
+  z_ci_name  <- paste0("z_ci_M4_", df_name)
+  
+# Fit model
+model4 <-  sdmTMB(
+  Abundance ~ 1 + (Age),
+  data = data,
+  family = tweedie(link = "log"),
+  mesh = bspde,
+  spatial = "on")  
+assign(model_name, model4, envir = .GlobalEnv)
+
+#Summary
+summary(model4)
+sanity(model4)
+
+params <-tidy(model4, conf.int = TRUE)
+tidy(model4, effects = "ran_par", conf.int = TRUE)
+
+# Extract param
+ P_est <- exp(params$estimate[1])
+ z_est <- -(params$estimate[2]) 
+  
+# SEs
+  P_se_log <-  params$std.error[1]
+  z_se <- params$std.error[2]
+  
+# CIs 
+  P_ci <- NA
+  z_ci <-  c(-params$conf.high[2], -params$conf.low[2])  
+  
+# Compute transformed estimates
+#LogP0 
+CV_P <- sqrt(exp(P_se_log^2) - 1)
+P_se <- P_est * CV_P
+P_ci_lower <- exp(params$conf.low[1]) 
+P_ci_upper <- exp(params$conf.high[1])
+
+# Spatial stracture
+  rep <- model4$tmb_obj$report()
+  sigma_O <- rep$sigma_O [1,1]
+  range<-  rep$range[1,1]
+ dispersion <-model4$sd_report$value["phi"]%>% as.numeric()
+
+  assign(omega_name, sigma_O, envir = .GlobalEnv)
+  assign(range_name, range, envir = .GlobalEnv)
+  assign(dispersion_name, dispersion, envir = .GlobalEnv)
+
+outablePo <- data.frame(
+    dataset       =  Survey,
+    parameter     = c("P"),
+    estimate_log  = params$estimate[1], 
+    estimate      = c(P_est),       # Unlog
+    se            = c(P_se) ,       #se of the estimated model,
+    ci_lower      = c(P_ci_lower),
+    ci_upper      = c(P_ci_upper),
+    CV            = c(CV_P),        
+    model         = "M4",
+    stringsAsFactors = FALSE) 
+
+  outableZ <- data.frame(
+    dataset   = c(Survey),
+    parameter = "z",
+    estimate  = c(z_est),
+    se        = c(z_se),
+    ci_lower  = c(z_ci[1]), #It haves been reversed because z insted of -z is modeld
+    ci_upper  = c(z_ci[2]),
+    CV        = c(z_se/z_est),
+    model     = "M4",
+    stringsAsFactors = FALSE)
+  
+#Predict in data points 
+# Back predict on the data:  for the  omega -and the  the plots 
+predic.grid1 <- data %>% filter(!is.na(Stage))  %>% filter(!is.na(Age))  
+predict1 <- predict(model4,newdata=predic.grid1,re_form = NA) #Turn of the spatial filed in the prediction
+
+model_prediction1 <- paste0("model_M4", df_name, "_pred1")
+assign(model_prediction1, predict1, envir = .GlobalEnv)
+
+# Plot
+  plot <- 
+     plot_basic +
+   geom_line(data = predict1, 
+             aes(x=Age, y= exp(est)), 
+             color = brewer.pal(7, "Dark2")[5], linewidth = 1) +
+   labs(title = "",
+        subtitle = paste(df_name),
+        x = "Age",
+        y = "Abundance"  ) +
+    theme_bw() +
+    theme(panel.grid.major = element_line(color = "white"))
+  
+assign(plot_name, plot, envir = .GlobalEnv) 
+
+#For the Ptot Prediction - as index standardization
+#1. Create the extrapolation grid (PA)
+grid_1km <- st_make_grid(
+  PA_polygone,
+  cellsize = 1,        # 1 unit = 1 km
+  square = TRUE,
+  what = "polygons")
+
+grid_clipped <- st_intersection(grid_1km, PA_polygone)  # Do the grid only in the Positive area 
+
+plot(grid_clipped)
+centroids <- st_centroid(grid_clipped)
+centroids_df <- st_coordinates(centroids) %>%
+  as.data.frame() 
+
+centroids_m <- centroids %>% st_sf()  # ensure sf
+st_geometry(centroids_m) <- st_geometry(centroids_m) * 1000  # km -> m
+st_crs(centroids_m) <- 32635
+centroids_wgs84 <- st_transform(centroids_m, crs = 4326)
+
+lonlat_df <- st_coordinates(centroids_wgs84) %>%
+  as.data.frame() %>% dplyr::rename(Lon = X, Lat = Y)
+
+centroids_df <- bind_cols(centroids_df, lonlat_df)
+
+#This is the new prediction grid that will force the prediction index standardization 
+#log(Pij)=log(Po) + ω +  (z*t) , but z*t=0 so --> log(Pij)=log(Po) + ω (Prediction is now Ptot)
+predic.grid2<- centroids_df %>% mutate(Age=0)
+
+#Predict
+predict2 <- predict(model4,newdata=predic.grid2,return_tmb_object = TRUE) 
+model_prediction2 <- paste0("model_M4", df_name, "_pred2")
+assign(model_prediction2, predict2, envir = .GlobalEnv)
+ 
+#3.Get the index (Ptot)
+index <- get_index(predict2, area =10^6, bias_correct = TRUE)  # 10^6 for making kM1--> M1
+index <- index %>% mutate(cv = sqrt(exp(se^2) - 1))   #Since se refere ot the log estimate
+
+outablelPtot <- data.frame(
+  dataset       =  Survey,
+  parameter = "Ptot",
+  estimate  = index$est, #estimate in the original scale
+  se        =  index$cv*index$est,  # re-estimate it because it was in log(abundance)
+  ci_lower  =  index$lwr,
+  ci_upper  =  index$upr,
+  CV        = index$cv,         # re-estimate it because it was in log(abundance))
+   model         = "M4",
+   stringsAsFactors = FALSE) 
+
+# Output tables
+return(list(outablePo= outablePo, outableZ=outableZ,outablelPtot=outablelPtot))
+}
+```
+
+### Fit M4
+```{r}
+results_all_M4 <- bind_rows(
+fit_glm_TWsp_M4(Str1_06,PA_2006_Str1,bspdeStr1_06,plot_M3_Str1_06),
+fit_glm_TWsp_M4(Str2_06,PA_2006_Str2,bspdeStr2_06,plot_M3_Str2_06))
+```
+
+### Get P,z results and estimate Ptot
+```{r}
+outablePo_temp_Str1<- results_all_M4$outablePo %>% filter(grepl("^Str1_",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+outablePo_temp_Str1 <- outablePo_temp_Str1 %>% select (-estimate_log)
+Str1_resultsPo <- rbind(Str1_resultsPo,outablePo_temp_Str1)
+gt(Str1_resultsPo)
+
+outablePo_temp_Str2<- results_all_M4$outablePo %>% filter(grepl("^Str2",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+outablePo_temp_Str2 <- outablePo_temp_Str2 %>% select (-estimate_log)
+Str2_resultsPo <- rbind(Str2_resultsPo,outablePo_temp_Str2)
+gt(Str2_resultsPo)
+
+outableZ_temp_Str1 <- results_all_M4$outableZ %>% filter(grepl("^Str1_",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+Str1_resultsZ <- rbind(Str1_resultsZ,outableZ_temp_Str1)
+gt(Str1_resultsZ)
+
+outableZ_temp_Str2 <- results_all_M4$outableZ %>% filter(grepl("^Str2_",dataset)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+Str2_resultsZ <- rbind(Str2_resultsZ,outableZ_temp_Str2)
+gt(Str2_resultsZ)
+
+
+Str1_resultsPtot_temp <-results_all_M4$outablelPtot %>% filter(grepl("^Str1_",dataset)) 
+
+Str1_resultsPtot <- rbind(Str1_resultsPtot,Str1_resultsPtot_temp)
+gt(Str1_resultsPtot)
+
+Str2_resultsPtot_temp <-results_all_M4$outablelPtot %>% filter(grepl("^Str2_",dataset)) 
+
+Str2_resultsPtot <- rbind(Str2_resultsPtot,Str2_resultsPtot_temp)
+gt(Str2_resultsPtot)
+
+```
+
+
+### Summary plots
+```{r}
+# Eastern stratum Po plot
+plot_Po_Str1<-
+ggplot() +
+  geom_point(data = Str1_resultsPo, aes(y = estimate, x = dataset, col = model),
+             size = 2,position = position_dodge(width = 0.4)) + 
+  geom_errorbar(data = Str1_resultsPo, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2,linewidth = 1, position = position_dodge(width = 0.4)) +  
+  theme_bw() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[0] ~ (eggs ~ m^-2 ~ day^-1))) +xlab("")+
+   scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+  
+# Western stratum Po plot
+plot_Po_Str2<-
+ggplot() +
+  geom_point(data = Str2_resultsPo, 
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position= position_dodge(width = 0.4))  + 
+  geom_errorbar(data = Str2_resultsPo, 
+                aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2,linewidth = 1,position=position_dodge(width = 0.4))  +  
+  theme_bw() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[0] ~ (eggs ~ m^-2 ~ day^-1))) +xlab("")+
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+  
+# Eastern stratum Z plot
+plot_z_Str1<-
+ggplot() +
+  geom_point(data = Str1_resultsZ,
+             aes(y = estimate, x = dataset, col = model),
+             size = 2, position=position_dodge(width = 0.4)) + 
+  geom_errorbar(
+    data = Str1_resultsZ, 
+    aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+    width = 0.2,linewidth = 1, position=position_dodge(width = 0.4)) +  
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression (Z~(day^-1))) +xlab("")+
+   scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+  
+# Western stratum Z plot
+plot_z_Str2<-
+ggplot() +
+  geom_point(
+    data = Str2_resultsZ, 
+    aes(y = estimate, x = dataset, col = model),
+    size =2, position=position_dodge(width = 0.4)) + 
+ geom_errorbar(data = Str2_resultsZ,
+               aes(x = dataset, ymin = ci_lower, ymax = ci_upper, color = model), 
+               width = 0.2,linewidth = 1,position=position_dodge(width = 0.4))  +  
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression (Z~(day^-1))) +xlab("")+
+   scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+  
+# Eastern stratum Ptot plot
+plot_Ptot_Str1<-
+ggplot() +
+  geom_point(data = Str1_resultsPtot, 
+             aes(y = estimate/10^11, x = dataset, col = model),
+             size=2,position=position_dodge(width = 0.4))+ 
+  geom_errorbar(data = Str1_resultsPtot, 
+                aes(x= dataset, ymin = ci_lower /10^11, ymax = ci_upper/10^11, color = model),
+                width = 0.2,linewidth = 1, position=position_dodge(width = 0.4))+   
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[tot] ~ (eggs ~ day^-1) ~x10^11 )) +xlab("")+
+  scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+  
+# Western stratum Ptot plot
+plot_Ptot_Str2<-
+ggplot() +
+  geom_point(data = Str2_resultsPtot,
+             aes(y = estimate/10^11, x = dataset, col = model),
+             size=2, position=position_dodge(width = 0.4)) + 
+  geom_errorbar(data = Str2_resultsPtot, 
+                aes(x= dataset, ymin = ci_lower /10^11, ymax = ci_upper/10^11, color = model), 
+                width = 0.2,linewidth = 1, position=position_dodge(width = 0.4)) +   
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[tot] ~ (eggs ~ day^-1) ~x10^11 )) +xlab("")+
+    scale_fill_manual(name = "Model",brewer.pal(1, "Set1"))
+  
+Summary_Plots<- 
+  print(plot_grid(
+    plot_Po_Str1,plot_Po_Str2,
+    plot_z_Str1, plot_z_Str2, 
+    plot_Ptot_Str1, plot_Ptot_Str2,
+    ncol =  2))
+```
+
+### Fits
+```{r}
+Ploted_fits_Str1<- print(plot_grid(plot_M4_Str1_06))
+Ploted_fits_Str2<- print(plot_grid(plot_M4_Str2_06))
+```
+
+### QQ and Residuals 
+```{r}
+Residuals_plots<- function(data,model,model_name){
+    df_name <- deparse(substitute(data))
+    res_plot_name  <- paste0("res_plot_",model_name,df_name)
+    res_qq_name  <- paste0("res_qq_",model_name,df_name)
+    data <- data %>% filter(!is.na(Abundance), !is.na(w_sn))
+     year <- sub(".*_(\\d{2}).*", "\\1", df_name) ;year <- paste0("20", year)
+   
+# Determine stratum
+ stratum <- case_when(
+  grepl("^Str1", df_name) ~ "Eastern stratum",
+  grepl("^Str2", df_name) ~ "Western stratum",
+  TRUE ~ "")
+
+# Generate predictions 
+df_res <- data.frame(
+  Age = data$Age,
+  Predicted = exp((predict(model, newdata = data.frame(Age = data$Age,X=data$X,Y=data$Y)))$est), # Unlog
+  Observed= data$Abundance) %>% mutate (Residual= residuals(model,type ="mle-mvn"))
+
+#Pearson Cor  
+r_val <- cor(df_res$Predicted, df_res$Observed, use = "complete.obs",method = "pearson")
+
+# Residual vs Fitted plot
+p_obs_pred <- ggplot(df_res, aes(x = Predicted, y = Observed)) +
+  geom_point(alpha = 0.6, color=brewer.pal(7, "Dark2")[5]) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  theme_bw() +
+  labs(
+    x = "",
+    y = "Observed",
+    subtitle = paste(model_name) )+
+annotate(
+  "text",
+  x = -Inf,
+  y = Inf,
+  label = sprintf("r = %.3f", r_val),
+  hjust = -0.1,
+  vjust = 1.1,
+  size =4, color="red") + 
+  theme_bw() +
+  theme(plot.margin = margin(t=0,r = 1,b =0,l = 1))
+  
+p_res_fit <- ggplot(df_res, aes(x = Predicted, y = Residual)) +
+    geom_point(alpha = 0.6,color=brewer.pal(7, "Dark2")[5]) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    theme_bw() +
+    labs(
+      x = "",
+      y = "Residuals",
+      subtitle="")+
+    theme_bw() +
+    theme(plot.margin = margin(t = 0,r = 1,b =0,l = 1)) 
+
+p_qq <- ggplot(df_res, aes(sample = Residual)) +
+    stat_qq(color=brewer.pal(7, "Dark2")[5]) +
+    stat_qq_line(linetype = "dashed", color = "red") +
+    theme_bw() +
+    labs(
+      x = "",
+      y = "Sample Q",
+      subtitle="") 
+    theme_bw() +
+    theme(plot.margin = margin(t=0,r = 1,b =0,l = 1)) 
+
+res_plots<- plot_grid(p_obs_pred,p_res_fit,p_qq, ncol=3)
+assign(res_plot_name, res_plots, envir = .GlobalEnv) 
+assign(res_qq_name, res_plots, envir = .GlobalEnv)  
+
+}
+Residuals_plots(Str1_06,model_M4Str1_06, "M4") ; res_plot_M4Str1_06 ;res_qq_M4Str1_06
+Residuals_plots(Str2_06,model_M4Str2_06, "M4") ; res_plot_M4Str2_06 ;res_qq_M4Str2_06
+
+Residuals_Str1_06<- print(plot_grid(res_plot_M0Str1_06,res_plot_M1Str1_06,res_plot_M2Str1_06,res_plot_M3Str1_06,res_plot_M4Str1_06,nrow=5))
+Residuals_Str2_06<- print(plot_grid(res_plot_M0Str2_06,res_plot_M1Str2_06,res_plot_M2Str2_06,res_plot_M3Str2_06,res_plot_M3Str2_06,nrow=5))
+```
+### DHAMR residuals 
+```{r}
+set.seed(123)
+Residuals_test <- data.frame(
+    Model = character(),
+    Uniformity = character(),
+    Uniformity_p = numeric(),
+    Dispersion = character(),
+    Dispersion_p= numeric(),
+    Quantile   = character(),
+    Quantile_p = numeric(),
+    ZeroInfl   = character(),
+    ZeroInfl_p = numeric(),
+    SpatialAut = character(),
+    SpatialAut_p= numeric())
+
+resid_Chek <- function(model, data, a = 0.05, model_name = NULL) {
+  
+  df_name <- deparse(substitute(data))
+  model_name <- paste0("model_M4", df_name)
+  
+ # Clean data
+ data <- data %>% filter(!is.na(Abundance), !is.na(w_sn))
+
+ # Simulate and calculate residuals
+ s_fit <- simulate(model, nsim = 500, type = "mle-mvn")
+ r_fit <- dharma_residuals(s_fit, model, return_DHARMa = TRUE)
+  
+ # Run DHARMa tests
+
+ res_tests<-DHARMa::testResiduals(r_fit,plot=T)  
+ q_test   <- DHARMa::testQuantiles(r_fit) # same as plotResiduals quantile residuals versus (ranked) fitted values. Check for homogeneity of variance-
+ zi_test  <- DHARMa::testZeroInflation(r_fit)
+
+# For the spatial autocoralation 
+simulationOutputS <- recalculateResiduals(
+  r_fit,
+  group = paste(data$X, data$Y),
+  aggregateBy = mean)
+  
+sp_test <- DHARMa::testSpatialAutocorrelation(
+  simulationOutputS,
+  x = unique(data$X),
+  y = unique(data$Y))
+  
+# Decide pass/fail
+un_re  <- ifelse(res_tests$uniformity$p.value  < a, "Fail", "Pass")
+dis_re  <- ifelse(res_tests$dispersion$p.value  < a, "Fail", "Pass")
+q_res  <- ifelse(q_test$p.value  < a, "Fail", "Pass")
+zi_res <- ifelse(zi_test$p.value < a, "Fail", "Pass")
+sp_res <- ifelse(sp_test$p.value < a, "Fail", "Pass")
+  
+# Add results to global table
+new_row <- data.frame(
+  Model = paste(model_name),
+  Uniformity = un_re,
+  Uniformity_p = round(res_tests$uniformity$p.value,4),
+  Dispersion = dis_re,
+  Dispersion_p = round(res_tests$dispersion$p.value,4),
+  Quantile = q_res,
+  Quantile_p= round(q_test$p.value,4),
+  ZeroInfl = zi_res,
+  ZeroInfl_p= round(zi_test$p.value,4),
+  SpatialAuto = sp_res,
+  SpatialAuto_p= round(sp_test$p.value,4) )
+  
+assign("Residuals_test", rbind(get("Residuals_test", envir = .GlobalEnv), new_row), envir = .GlobalEnv)
+
+}
+
+resid_Chek(model_M4Str1_06,Str1_06)
+resid_Chek(model_M4Str2_06,Str2_06)
+
+gt(Residuals_test,caption = "Residuals Test")
+Residuals_test_M4 <- Residuals_test
+# Do a summary 
+# Select only the test columns
+test_cols <- c("Uniformity", "Dispersion", "Quantile", "ZeroInfl", "SpatialAuto")
+
+# Function to count Pass
+count_pass <- function(x) sum(x == "Pass")
+
+# Create summary
+summary_table <- data.frame(
+  Test = test_cols,
+  Pass = sapply(Residuals_test[test_cols], count_pass),
+  Total = nrow(Residuals_test))
+
+# Add Pass Rate as percentage
+summary_table$PassRate <- round(summary_table$Pass / summary_table$Total * 100, 1)
+
+# View the summary table
+print(summary_table)
+Residuals_test_M4_sum <- summary_table
+```
+
+### Omegas
+```{r}
+#plot all the omegas 
+all_omega_Str1 <- c(
+  model_M4Str1_06_pred2$data$omega_s)
+
+color_limits_Str1 <- c(min(all_omega_Str1, na.rm = TRUE),max(all_omega_Str1, na.rm = TRUE)) 
+
+all_omega_Str2 <- c( model_M4Str2_06_pred2$data$omega_s)
+
+color_limits_Str2 <- c(min(all_omega_Str2, na.rm = TRUE),max(all_omega_Str2, na.rm = TRUE)) 
+
+#I do this with tiles as my surface is continuous.
+tile_size <- 0.015
+tile_width <- 1 / (111 * cos(25 * pi/180))  # ~0.0102°
+tile_height <- 1 / 111  # ~0.0090°
+tile_height <- tile_height * 1.15
+tile_width <- tile_width * 1.2
+
+plot_O_pub_Str1 <- function(prediction, m_code, legend = TRUE) {
+  
+p<- ggplot() +
+   # Coastline
+  geom_tile(
+    data = prediction,
+    aes(x = Lon, y = Lat, fill = omega_s),
+    width = tile_width,  # adjust to your grid spacing
+    height = tile_height
+  ) +
+   scale_fill_gradient2(name = expression(omega[s]),
+     low = "red", mid = "white", high = "blue",
+     midpoint = 0,
+     limits = color_limits_Str1)+
+    labs(x = "Longitude", y = "Latitude", title = m_code) +
+    theme(panel.background = element_rect(fill = "gray85", color = NA))+
+    geom_sf(data = coast, fill = "gray20", col = "gray50") +
+    coord_sf(xlim = c(23.5, 26), ylim = c(39.3, 41)) +
+    scale_x_continuous(breaks = seq(23.5, 26.5, by = 1))
+     
+ if(!legend) {
+   p <- p + theme(legend.position = "none")
+  }
+    print(p)
+}
+
+
+plot_O_pub_Str2 <- function(prediction, m_code, legend = TRUE) {
+  
+p<- ggplot() +
+  geom_tile(
+    data = prediction,
+    aes(x = Lon, y = Lat, fill = omega_s),
+    width = tile_width,  
+    height = tile_height
+  ) +
+    scale_fill_gradient2(name = expression(omega[s]),
+     low = "red", mid = "white", high = "blue",
+     midpoint = 0,
+     limits = color_limits_Str2)+
+  labs(x = "Longitude", y = "Latitude", title = m_code) +
+    theme(panel.background = element_rect(fill = "gray85", color = NA))+
+    geom_sf(data = coast, fill = "gray20", col = "gray50") +
+    coord_sf(xlim = c(22.5, 25), ylim = c(38.3, 40.9))+
+    scale_x_continuous(breaks = seq(22.5, 25, by = 1))
+
+if(!legend) {
+   p <- p + theme(legend.position = "none")
+  }
+    print(p)
+}
+
+plotomega_Str1_06 <- plot_O_pub_Str1(model_M4Str1_06_pred2$data, "2006", legend = TRUE) 
+plots_grid_Str1   <- plot_grid(plotomega_Str1_06)
+
+plotomega_Str2_06 <- plot_O_pub_Str2(model_M4Str2_06_pred2$data, "2006", legend = TRUE) 
+plots_grid_Str2   <- plot_grid(plotomega_Str2_06)
+```
+
+
+## Model 5: GLMM with tweedie, spatial autocorralation and spatial z
+
+### Write M5 function 
+
+```{r}
+fit_glm_TW_svc_M5 <- function(data,PA_polygone,bspde,plot_basic)  {
+
+# Get data frame name
+df_name <- deparse(substitute(data))
+model_name <- paste0("model_M5", df_name)
+Survey <- as.character(data$Survey[1])
+  
+data <- data %>% filter(!is.na(Abundance))
+data <- data %>% filter(!is.na(w_sn))
+Year <- as.character(data$Year[1])
+  
+# Build dynamic object names
+plot_name  <- paste0("plot_M5_", df_name)
+plot_log_name  <- paste0("plot_log_M5_", df_name)
+omega_name  <- paste0("omegaSD_M5_", df_name)
+z_name  <- paste0("svcSD_M5_", df_name)
+range_name  <- paste0("range_M5_", df_name)
+dispersion_name  <- paste0("dispersion_M5_", df_name)
+
+P_est_name <- paste0("P_est_M5_", df_name)
+z_est_name <- paste0("z_est_M5_", df_name)
+  
+P_se_name  <- paste0("P_se_M5_", df_name)
+z_se_name  <- paste0("z_se_M5_", df_name)
+  
+P_ci_name  <- paste0("P_ci_M5_", df_name)
+z_ci_name  <- paste0("z_ci_M5_", df_name)
+
+model5 <-  sdmTMB(
+  Abundance ~ 1 + (Age),
+  data = data,
+  family = tweedie (link = "log"),
+  #weights = data$w_sn,
+  mesh = bspde,
+  spatial = "on",
+  spatial_varying = ~ Age)
+
+assign(model_name, model5, envir = .GlobalEnv)
+
+#Summary
+summary(model5)
+sanity(model5)
+
+params <-tidy(model5, conf.int = TRUE)
+tidy(model5, effects = "ran_par", conf.int = TRUE)
+
+ # Extract params
+  P_est <- exp(params$estimate[1]) 
+  z_est <- -(params$estimate[2])
+  
+  # SEs
+  P_se_log <-  params$std.error[1]
+  z_se <- params$std.error[2]
+  
+  # CIs 
+  P_ci <- NA
+  z_ci <-  c(-params$conf.high[2], -params$conf.low[2])
+  
+  # Compute transformed estimates
+  #LogP0  
+  CV_P <- sqrt(exp(P_se_log^2) - 1)
+  P_se <- P_est * CV_P
+  P_ci_lower <- exp(params$conf.low[1]) 
+  P_ci_upper <- exp(params$conf.high[1])
+
+  # Spatial stracture
+  rep <- model5$tmb_obj$report()
+  sigma_O <- rep$sigma_O [1,1]
+  sigma_Z <- rep$sigma_Z [1,1]
+  range  <-  rep$range[1,1]
+  dispersion <-model5$sd_report$value["phi"]%>% as.numeric()
+
+  assign(omega_name, sigma_O, envir = .GlobalEnv)
+  assign(range_name, range, envir = .GlobalEnv)
+  assign(z_name, sigma_Z, envir = .GlobalEnv)
+  assign(dispersion_name, dispersion, envir = .GlobalEnv)
+
+  outablePo <- data.frame(
+    dataset       =  Survey,
+    parameter     = c("P"),
+    estimate_log  = params$estimate[1], 
+    estimate      = c(P_est),       # Unlog
+    se            = c(P_se) ,       #se of the estimated model,
+    ci_lower      = c(P_ci_lower),
+    ci_upper      = c(P_ci_upper),
+    CV            = c(CV_P),        
+    model         = "M5",
+    stringsAsFactors = FALSE) 
+  
+  outableZ <- data.frame(
+    dataset   = c(Survey),
+    parameter = "z",
+    estimate  = c(z_est),
+    se        = c(z_se),
+    ci_lower  = c(z_ci[1]), #It haves been reversed because z insted of -z is modeld
+    ci_upper  = c(z_ci[2]),
+    CV        = c(z_se/z_est),
+    model     = "M5",
+    stringsAsFactors = FALSE)
+
+ #Predict in data points 
+  # Back predict on the data:  for the  omega -and the  the plots 
+predic.grid1 <- data %>% filter(!is.na(Stage))  %>% filter(!is.na(Age))  
+predict1 <- predict(model5,newdata=predic.grid1,re_form = NA) #Turn of the spatial filed in the prediction
+  
+model_prediction1 <- paste0("model_M5", df_name, "_pred1")
+assign(model_prediction1, predict1, envir = .GlobalEnv)
+  
+# Plot
+plot <- 
+    plot_basic +
+     geom_line(data = predict1, aes(x=Age, y= exp(est)), color = brewer.pal(7, "Dark2")[6], linewidth = 1) +
+    labs(
+      title = "",
+      subtitle = paste(df_name),#, ": P=", round(P_est, 3), ", z=", round(z_est, 3)),
+      x = "Age",
+      y = "Abundance"
+    ) +
+    theme_bw() +
+    theme(panel.grid.major = element_line(color = "white"))
+  
+  assign(plot_name, plot, envir = .GlobalEnv) #print(plo)
+  
+ 
+  #For the Ptot Prediction -Treet as index stundardization
+  #1. Create the extrapolation grid (PA- division)
+  grid_1km <- st_make_grid(
+    PA_polygone,
+    cellsize = 1,        # 1 unit = 1 km
+    square = TRUE,
+    what = "polygons")
+  
+  grid_clipped <- st_intersection(grid_1km, PA_polygone)  # Do the grid only in the Positive area 
+  
+  plot(grid_clipped)
+  centroids <- st_centroid(grid_clipped)
+  centroids_df <- st_coordinates(centroids) %>%
+    as.data.frame() 
+  
+  centroids_m <- centroids %>% st_sf()  # ensure sf
+  st_geometry(centroids_m) <- st_geometry(centroids_m) * 1000  # km -> m
+  st_crs(centroids_m) <- 32635
+  centroids_wgs84 <- st_transform(centroids_m, crs = 4326)
+  
+  lonlat_df <- st_coordinates(centroids_wgs84) %>%
+    as.data.frame() %>% dplyr::rename(Lon = X, Lat = Y)
+  
+  centroids_df <- bind_cols(centroids_df, lonlat_df)
+  
+  #This is the new prediction grid that will force the prediction index standardization 
+  #log(Pij)=log(Po) + ω +  (z*t) , but z*t=0 so --> log(Pij)=log(Po) + ω (Prediction is now Ptot)
+  predic.grid2<- centroids_df %>% mutate(Age=0)
+  
+  #Predict
+  predict2 <- predict(model5,newdata=predic.grid2,return_tmb_object = TRUE) 
+  model_prediction2 <- paste0("model_M5", df_name, "_pred2")
+  assign(model_prediction2, predict2, envir = .GlobalEnv)
+  
+  #3.Get the index (Ptot)
+  index <- get_index(predict2, area =10^6, bias_correct = TRUE)  # 10^6 for making kM1--> M1
+  index <- index %>% mutate(cv = sqrt(exp(se^2) - 1))   #Since se refere ot the log estimate
+  
+  outablelPtot <- data.frame(
+    dataset       =  Survey,
+    parameter = "Ptot",
+    estimate  = index$est, #estimate in the original scale
+    se        =  index$cv*index$est,  # re-estimate it because it was in log(abundance)
+    ci_lower  =  index$lwr,
+    ci_upper  =  index$upr,
+    CV        = index$cv,          # re-estimate it because it was in log(abundance))
+    model         = "M5",
+    stringsAsFactors = FALSE) 
+  
+  # Output tables
+  return(list(outablePo= outablePo, outableZ=outableZ,outablelPtot=outablelPtot))
+}
+```
+### Fit M5
+```{r}
+results_all_M5 <- bind_rows(
+fit_glm_TW_svc_M5(Str1_06,PA_2006_Str1,bspdeStr1_06,plot_M4_Str1_06),
+fit_glm_TW_svc_M5(Str2_06,PA_2006_Str2,bspdeStr2_06,plot_M4_Str2_06))
+# (Z=0)
+
+```
+
+
+### Get P,z results and estimate Ptot
+```{r}
+all_datasets_Str1 <- data.frame(
+  dataset = c( "Str1_03","Str1_04","Str1_05","Str1_06","Str1_08","Str1_14","Str1_16","Str1_19","Str1_22"))
+
+all_datasets_Str2 <- data.frame(
+  dataset = c( "Str2_03","Str2_04","Str2_05","Str2_06","Str2_08","Str2_14","Str2_16","Str2_19","Str2_22"))
+
+outablePo_temp_Str1 <- results_all_M5$outablePo %>% 
+  filter(grepl("^Str1_", dataset)) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  select(-estimate_log) %>%
+  right_join(all_datasets_Str1, by = "dataset") %>%
+  arrange(dataset) %>%
+  mutate(model = "M5")
+Str1_resultsPo <- rbind(Str1_resultsPo,outablePo_temp_Str1)
+gt(Str1_resultsPo)
+
+outablePo_temp_Str2 <- results_all_M5$outablePo %>%
+  filter(grepl("^Str2_", dataset)) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  select(-estimate_log) %>%
+  right_join(all_datasets_Str2, by = "dataset") %>%
+  arrange(dataset) %>%
+  mutate(model = "M5")
+Str2_resultsPo <- rbind(Str2_resultsPo,outablePo_temp_Str2)
+gt(Str2_resultsPo)
+
+outableZ_temp_Str1 <- results_all_M5$outableZ   %>% 
+  filter(grepl("^Str1_",dataset)) %>% 
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  right_join(all_datasets_Str1, by = "dataset") %>%
+  arrange(dataset) %>%
+  mutate(model = "M5")
+
+Str1_resultsZ <- rbind(Str1_resultsZ,outableZ_temp_Str1)
+gt(Str1_resultsZ)
+
+outableZ_temp_Str2 <- results_all_M5$outableZ %>%
+  filter(grepl("^Str2_",dataset)) %>% 
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+ right_join(all_datasets_Str2, by = "dataset") %>%
+  arrange(dataset) %>%
+  mutate(model = "M5")
+ Str2_resultsZ <- rbind(Str2_resultsZ,outableZ_temp_Str2)
+gt(Str2_resultsZ)
+
+#Plot will be prediction output 
+Str1_resultsPtot_temp <-results_all_M5$outablelPtot  %>% filter(grepl("^Str1_",dataset)) %>%  
+ mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+ right_join(all_datasets_Str1, by = "dataset") %>%
+ arrange(dataset) %>%
+ mutate(model = "M5")
+
+Str1_resultsPtot <- rbind(Str1_resultsPtot,Str1_resultsPtot_temp)
+gt(Str1_resultsPtot)
+
+Str2_resultsPtot_temp <-results_all_M5$outablelPtot %>% filter(grepl("^Str2_",dataset)) %>%  
+ mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+ right_join(all_datasets_Str2, by = "dataset") %>%
+ arrange(dataset) %>%
+ mutate(model = "M5")
+
+Str2_resultsPtot <- rbind(Str2_resultsPtot,Str2_resultsPtot_temp)
+gt(Str2_resultsPtot)
+```
+
+### Fits 
+```{r}
+Ploted_fits_Str1<- print(plot_grid(plot_M5_Str1_06))
+```
+
+### QQ and Residuals
+```{r}
+Residuals_plots<- function(data,model,model_name){
+    df_name <- deparse(substitute(data))
+    res_plot_name  <- paste0("res_plot_",model_name,df_name)
+    res_qq_name  <- paste0("res_qq_",model_name,df_name)
+    data <- data %>% filter(!is.na(Abundance), !is.na(w_sn))
+    year <- sub(".*_(\\d{2}).*", "\\1", df_name) ;year <- paste0("20", year)
+   
+ # Determine stratum
+ stratum <- case_when(
+  grepl("^Str1", df_name) ~ "Eastern stratum",
+  grepl("^Str2", df_name) ~ "Western stratum",
+  TRUE ~ "")
+ 
+# Generate predictions on the original Age values
+df_res <- data.frame(
+  Age = data$Age,
+  Predicted = exp((predict(model, newdata = data.frame(Age = data$Age,X=data$X,Y=data$Y)))$est),# Unlog
+  Observed= data$Abundance) %>% mutate (Residual= residuals(model,type ="mle-mvn"))
+
+#Pearson Cor  
+r_val <- cor(df_res$Predicted, df_res$Observed, use = "complete.obs",method = "pearson")
+
+# Residual vs Fitted plot
+p_obs_pred <- ggplot(df_res, aes(x = Predicted, y = Observed)) +
+  geom_point(alpha = 0.6, color = brewer.pal(7, "Dark2")[6]) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    x = "Fitted",
+    y = "Observed",
+    subtitle = paste(model_name) )+
+annotate(
+  "text",
+  x = -Inf,
+  y = Inf,
+  label = sprintf("r = %.3f", r_val),
+  hjust = -0.1,
+  vjust = 1.1,
+  size =4, color="red")  +
+  theme_bw() +
+  theme(plot.margin = margin(t=0.2,r = 1,b =0,l = 1))
+  
+p_res_fit <- ggplot(df_res, aes(x = Predicted, y = Residual)) +
+    geom_point(alpha = 0.6, color = brewer.pal(7, "Dark2")[6]) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    theme_bw() +
+    labs(
+      x = "Fitted",
+      y = "Residuals", 
+      subtitle="") + 
+      theme_bw() +
+  theme(plot.margin = margin(t=0.2,r = 1,b =0,l = 1))
+
+p_qq <- ggplot(df_res, aes(sample = Residual)) +
+    stat_qq( color = brewer.pal(7, "Dark2")[6]) +
+    stat_qq_line(linetype = "dashed", color = "red") +
+    theme_bw() +
+    labs(
+      x = "Theoretical Q",
+      y = "Sample Q",
+      subtitle="")  + 
+      theme_bw() +
+     theme(plot.margin = margin(t=0.2,r = 1,b =0,l = 1))
+
+res_plots<- plot_grid(p_obs_pred,p_res_fit,p_qq, ncol=3)
+assign(res_plot_name, res_plots, envir = .GlobalEnv) 
+assign(res_qq_name, res_plots, envir = .GlobalEnv)  
+}
+
+
+Residuals_plots(Str1_06,model_M5Str1_06, "M5") ; res_plot_M5Str1_06 ;res_qq_M5Str1_06
+#Residuals_plots(Str2_06,model_M5Str2_06, "M5") ; res_plot_M5Str2_06 ;res_qq_M5Str2_06
+
+Residuals_Str1_06 <- (  
+  res_plot_M0Str1_06 /
+  res_plot_M1Str1_06 /
+  res_plot_M2Str1_06 /
+  res_plot_M3Str1_06 /
+  res_plot_M4Str1_06 /
+  res_plot_M5Str1_06) + plot_annotation(title = "Eastern Stratum 2006")
+
+Residuals_Str2_06 <- (  
+  res_plot_M0Str2_06 /
+  res_plot_M1Str2_06 /
+  res_plot_M2Str2_06 /
+  res_plot_M3Str2_06 /
+  res_plot_M4Str2_06 /
+  plot_spacer()) + plot_annotation(title = "Western Stratum 2006")
+
+```
+
+### Summary plots
+```{r}
+Str1_resultsPo$dataset_short <- paste0("20", sub("^Str1_", "", Str1_resultsPo$dataset))
+  
+plot_Po_Str1<-
+ggplot() +
+  geom_point(data = Str1_resultsPo,
+             aes(y = estimate, x = dataset_short, col = model),
+             size = 1,position = position_dodge(width = 0.65)) + 
+  geom_errorbar(data = Str1_resultsPo, 
+                aes(x = dataset_short, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2,linewidth = 0.5, position = position_dodge(width = 0.65)) +  
+  theme_bw() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab("")+ ylab("")+
+    scale_colour_brewer(name = "Model", palette = "Dark2")+theme(legend.position = "none")    +   facet_wrap(~factor("B. Eastern Stratum"))+
+  theme(strip.background = 
+         element_rect(fill = "white",colour = "black",strip.background = element_blank(),strip.text = element_text(face = "bold"))) 
+  
+
+Str1_resultsPo <- Str1_resultsPo %>% select(-dataset_short)
+
+Str2_resultsPo$dataset_short <- paste0("20", sub("^Str2_", "", Str2_resultsPo$dataset))
+
+plot_Po_Str2<-ggplot() +
+geom_point(data = Str2_resultsPo, 
+           aes(y = estimate, x = dataset_short, col = model),
+           size = 1, position=    position_dodge(width = 0.65))  + 
+  geom_errorbar(data = Str2_resultsPo,
+                aes(x = dataset_short, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2,linewidth = 0.5,position=position_dodge(width = 0.65))  +  
+  theme_bw() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[0] ~ (eggs ~ m^-2 ~ day^-1))) + xlab("")+ 
+  scale_colour_brewer(name = "Model",palette = "Dark2")+
+  theme(legend.position = "none") +facet_wrap(~factor("A. Western Stratum"))+
+  theme(strip.background = element_rect(fill = "white",colour = "black",strip.background = element_blank(), strip.text = element_text(face = "bold"))) 
+
+Str2_resultsPo <- Str2_resultsPo %>% select(-dataset_short)
+
+
+Str1_resultsZ$dataset_short <- paste0("20", sub("^Str1_", "", Str1_resultsZ$dataset))
+
+plot_z_Str1<-ggplot() +
+  geom_point(data = Str1_resultsZ,
+             aes(y = estimate, x = dataset_short, col = model),
+             size = 1, position=position_dodge(width = 0.65)) + 
+  geom_errorbar(data = Str1_resultsZ, 
+                aes(x = dataset_short, ymin = ci_lower, ymax = ci_upper, color = model), 
+                width = 0.2,linewidth = 0.5, position=position_dodge(width = 0.65)) +  
+  xlab("")+ ylab("")+
+  theme_bw() +
+ theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  scale_colour_brewer(name = "Model",  palette = "Dark2")+
+  theme(legend.position = "none")
+
+
+Str1_resultsZ <- Str1_resultsZ %>% select(-dataset_short)
+
+Str2_resultsZ$dataset_short <- paste0("20", sub("^Str2_", "", Str2_resultsZ$dataset))
+
+plot_z_Str2<-ggplot() +
+  geom_point(data = Str2_resultsZ,
+             aes(y = estimate, x = dataset_short, col = model),
+             size =1, position=position_dodge(width = 0.65)) + 
+  geom_errorbar(data = Str2_resultsZ, 
+                aes(x = dataset_short, ymin = ci_lower, ymax = ci_upper, color = model),
+                width = 0.2,linewidth = 0.5,position=position_dodge(width = 0.65))  +  
+   theme_bw() + 
+   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression (Z~(day^-1))) +xlab("")+
+   scale_colour_brewer(name = "Model",palette = "Dark2")+
+  theme(legend.position = "none")
+
+Str2_resultsZ <- Str2_resultsZ %>% select(-dataset_short)
+
+Str1_resultsPtot$dataset_short <- paste0("20", sub("^Str1_", "", Str1_resultsPtot$dataset))
+
+plot_Ptot_Str1<- ggplot() +
+  geom_point(data = Str1_resultsPtot, 
+             aes(y = estimate/10^11, x = dataset_short, col = model),
+             size=1,position=position_dodge(width = 0.65))+ 
+  geom_errorbar(data = Str1_resultsPtot,
+                aes(x= dataset_short, 
+                    ymin = ci_lower /10^11, ymax = ci_upper/10^11, color = model), 
+                  width = 0.2,linewidth = 0.5, position=position_dodge(width = 0.65)) +   
+  ylab("")+xlab("")+  
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_colour_brewer(name = "Model",palette = "Dark2") +
+  theme(legend.position = "none")
+
+Str1_resultsPtot <- Str1_resultsPtot %>% select(-dataset_short)
+
+
+Str2_resultsPtot$dataset_short <- paste0("20", sub("^Str2_", "", Str2_resultsPtot$dataset))
+
+plot_Ptot_Str2<-ggplot() +
+  geom_point(data = Str2_resultsPtot, 
+             aes(y = estimate/10^11, x = dataset_short, col = model),
+             size=1, position=position_dodge(width = 0.65)) + 
+ geom_errorbar(data = Str2_resultsPtot, 
+                aes(x= dataset_short, ymin = ci_lower /10^11, ymax = ci_upper/10^11, color = model), width = 0.2,linewidth = 0.5, position=position_dodge(width = 0.65)) +   
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab(expression(P[tot] ~ (eggs ~ day^-1) ~x10^11 )) +xlab("")+
+  scale_colour_brewer(name = "Model",  palette = "Dark2") +
+  theme(legend.position = "none") 
+
+Str2_resultsPtot <- Str2_resultsPtot %>% select(-dataset_short)
+
+ 
+Summary_Plots<- 
+  print(plot_grid(plot_Po_Str2,plot_Po_Str1,
+                  plot_z_Str2, plot_z_Str1,
+                  plot_Ptot_Str2, plot_Ptot_Str1,
+                  ncol =  2))
+         
+model_legent_Str1 <- 
+  get_legend(plot_Ptot_Str2 + 
+               theme(legend.position = "bottom")+
+               guides(color = guide_legend(nrow = 1))) 
+
+final_Summary_Plots <- plot_grid(
+   Summary_Plots,
+   model_legent_Str1,
+   ncol = 1,        
+   rel_heights = c(1,0.05))
+```
+
+### DHAMR residuals 
+```{r}
+set.seed(123)
+Residuals_test <- data.frame(
+    Model = character(),
+    Uniformity = character(),
+    Uniformity_p = numeric(),
+    Dispersion = character(),
+    Dispersion_p= numeric(),
+    Quantile   = character(),
+    Quantile_p = numeric(),
+    ZeroInfl   = character(),
+    ZeroInfl_p = numeric(),
+    SpatialAut = character(),
+    SpatialAut_p= numeric())
+
+resid_Chek <- function(model, data, a = 0.05, model_name = NULL) {
+  
+df_name <- deparse(substitute(data))
+model_name <- paste0("model_M5", df_name)
+  
+# Clean data
+data <- data %>% filter(!is.na(Abundance), !is.na(w_sn))
+
+# Simulate and calculate residuals
+s_fit <- simulate(model, nsim = 500, type = "mle-mvn")
+r_fit <- dharma_residuals(s_fit, model, return_DHARMa = TRUE)
+
+# Run DHARMa tests
+
+res_tests<-DHARMa::testResiduals(r_fit,plot=T)  
+q_test   <- DHARMa::testQuantiles(r_fit) # same as plotResiduals quantile residuals versus (ranked) fitted values. Check for homogeneity of variance-
+zi_test  <- DHARMa::testZeroInflation(r_fit)
+
+# For the spatial autocorelation 
+simulationOutputS <- recalculateResiduals(
+  r_fit,
+  group = paste(data$X, data$Y),
+  aggregateBy = mean)
+  
+sp_test <- DHARMa::testSpatialAutocorrelation(
+    simulationOutputS,
+    x = unique(data$X),
+    y = unique(data$Y)  )
+  
+# Decide pass/fail
+un_re  <- ifelse(res_tests$uniformity$p.value  < a, "Fail", "Pass")
+dis_re  <- ifelse(res_tests$dispersion$p.value  < a, "Fail", "Pass")
+q_res  <- ifelse(q_test$p.value  < a, "Fail", "Pass")
+zi_res <- ifelse(zi_test$p.value < a, "Fail", "Pass")
+sp_res <- ifelse(sp_test$p.value < a, "Fail", "Pass")
+  
+# Add results to global table
+new_row <- data.frame(
+  Model = paste(model_name),
+  Uniformity = un_re,
+  Uniformity_p = round(res_tests$uniformity$p.value,4),
+  Dispersion = dis_re,
+  Dispersion_p = round(res_tests$dispersion$p.value,4),
+  Quantile = q_res,
+  Quantile_p= round(q_test$p.value,4),
+  ZeroInfl = zi_res,
+  ZeroInfl_p= round(zi_test$p.value,4),
+  SpatialAuto = sp_res,
+  SpatialAuto_p= round(sp_test$p.value,4))
+  
+assign("Residuals_test", rbind(get("Residuals_test", envir = .GlobalEnv), new_row), envir = .GlobalEnv)
+
+}
+
+resid_Chek(model_M5Str1_06,Str1_06)
+ #resid_Chek(model_M5Str2_06,Str2_06)
+
+gt(Residuals_test,caption = "Residuals Test")
+Residuals_test_M5 <- Residuals_test
+
+#Do a  sum 
+# Select only the test columns
+test_cols <- c("Uniformity", "Dispersion", "Quantile", "ZeroInfl", "SpatialAuto")
+
+# Function to count Pass
+count_pass <- function(x) sum(x == "Pass")
+
+# Create summary
+summary_table <- data.frame(
+  Test = test_cols,
+  Pass = sapply(Residuals_test[test_cols], count_pass),
+  Total = nrow(Residuals_test))
+
+# Add Pass Rate as percentage
+summary_table$PassRate <- round(summary_table$Pass / summary_table$Total * 100, 1)
+
+# View the summary table
+print(summary_table)
+Residuals_test_M5_sum<-summary_table 
+```
+
+### Omegas
+```{r}
+all_omega_Str1 <- c(
+  model_M5Str1_06_pred2$data$omega_s)
+
+color_limits_Str1 <- c(min(all_omega_Str1, na.rm = TRUE),max(all_omega_Str1, na.rm = TRUE)) 
+
+#all_omega_Str2 <- c(model_M5Str2_06_pred2$data$omega_s)
+#color_limits_Str2 <- c(min(all_omega_Str2, na.rm = TRUE),max(all_omega_Str2, na.rm = TRUE)) 
+
+#I do this with tiles as my surface is continuous.
+tile_size <- 0.015
+tile_width <- 1 / (111 * cos(25 * pi/180))  # ~0.0102°
+tile_height <- 1 / 111  # ~0.0090°
+tile_height <- tile_height * 1.15
+tile_width <- tile_width * 1.2
+
+plot_O_pub_Str1 <- function(prediction, m_code, legend = TRUE) {
+  
+p<- ggplot() +
+   # Coastline
+  geom_tile(
+    data = prediction,
+    aes(x = Lon, y = Lat, fill = omega_s),
+    width = tile_width,  
+    height = tile_height) +
+    scale_fill_gradient2(name = expression(omega[s]),
+     low = "red", mid = "white", high = "blue",
+     midpoint = 0, 
+     limits = color_limits_Str1)+
+    labs(x = "Longitude", y = "Latitude", title = m_code) +
+    theme(panel.background = element_rect(fill = "gray85", color = NA))+
+    geom_sf(data = coast, fill = "gray20", col = "gray50") +
+    coord_sf(xlim = c(23.5, 26), ylim = c(39.3, 41)) +
+    scale_x_continuous(breaks = seq(23.5, 26.5, by = 1))
+      if(!legend) {
+   p <- p + theme(legend.position = "none")
+  }
+    print(p)
+}
+  
+plot_O_pub_Str2 <- function(prediction, m_code, legend = TRUE) {
+  
+p<- ggplot() +
+  geom_tile(
+    data = prediction,
+    aes(x = Lon, y = Lat, fill = omega_s),
+    width = tile_width, 
+    height = tile_height  ) +
+    scale_fill_gradient2(name = expression(omega[s]),
+     low = "red", mid = "white", high = "blue",
+     midpoint = 0, 
+     limits = color_limits_Str2)+
+  labs(x = "Longitude", y = "Latitude", title = m_code) +
+    theme(panel.background = element_rect(fill = "gray85", color = NA))+
+    geom_sf(data = coast, fill = "gray20", col = "gray50") +
+    coord_sf(xlim = c(22.5, 25), ylim = c(38.3, 40.9))+
+    scale_x_continuous(breaks = seq(22.5, 25, by = 1))
+if(!legend) {
+   p <- p + theme(legend.position = "none")
+  }
+    print(p)
+}
+
+plotomega_Str1_06 <- plot_O_pub_Str1(model_M5Str1_06_pred2$data, "2006", legend = TRUE) 
+#plotomega_Str2_06 <- plot_O_pub_Str2(model_M5Str2_06_pred2$data, "2006", legend = TRUE) 
+```
+
+### SVC_z
+```{r}
+#I do this with tiles as my surface is continious
+tile_size <- 0.015
+tile_width <- 1 / (111 * cos(25 * pi/180))  # ~0.0102°
+tile_height <- 1 / 111  # ~0.0090°
+tile_height <- tile_height * 1.15
+tile_width <- tile_width * 1.2
+
+
+plot_z_pub_Str1 <- function(prediction, m_code, legend = TRUE) {
+    p<- ggplot() +
+    geom_tile(
+    data = prediction,
+    aes(x = Lon, y = Lat, fill = -zeta_s_Age),
+    width = tile_width,  
+    height = tile_height  ) +
+    scale_fill_gradient2(name = expression(z[s]),
+     low = "red", mid = "white", high = "blue",
+    midpoint = 0,
+    guide = guide_colorbar( barwidth = unit(2.5, "mm"), barheight = unit(15, "mm")))+
+    labs(x = "Longitude", y = "Latitude", title = m_code) +
+    theme(panel.background = element_rect(fill = "gray85", color = NA))+
+    geom_sf(data = coast, fill = "gray20", col = "gray50") +
+    coord_sf(xlim = c(23.5, 26), ylim = c(39.3, 41)) +
+   scale_x_continuous(breaks = seq(23.5, 26.5, by = 1))
+  
+     if(!legend) {
+   p <- p + theme(legend.position = "none")
+  }
+    print(p)
+}
+
+
+plotz_06 <- plot_z_pub_Str1(model_M5Str1_06_pred2$data ,"2006", legend = TRUE)   
+
+ 
+#I do this with tiles as my surface is continious
+tile_size <- 0.015
+tile_width <- 1 / (111 * cos(25 * pi/180))  # ~0.0102°
+tile_height <- 1 / 111  # ~0.0090°
+tile_height <- tile_height * 1.15
+tile_width <- tile_width * 1.2
+
+
+plot_z_pub_Str2 <- function(prediction, m_code, legend = TRUE) {
+    p<- ggplot() +
+    geom_tile(
+    data = prediction,
+    aes(x = Lon, y = Lat, fill = -zeta_s_Age),
+    width = tile_width, 
+    height = tile_height) +
+    scale_fill_gradient2(name = expression(z[s]),
+    low = "red", mid = "white", high = "blue",
+    midpoint = 0,
+    guide = guide_colorbar( barwidth = unit(2.5, "mm"), barheight = unit(15, "mm")))+
+    labs(x = "Longitude", y = "Latitude", title = m_code) +
+    theme(panel.background = element_rect(fill = "gray85", color = NA))+
+    geom_sf(data = coast, fill = "gray20", col = "gray50") +
+    coord_sf(xlim = c(22.5, 25), ylim = c(38.3, 40.9))+
+    scale_x_continuous(breaks = seq(22.5, 25, by = 1))
+  
+     if(!legend) {
+   p <- p + theme(legend.position = "none")
+  }
+    print(p)
+}
+
+#plotz_06 <- plot_z_pub_Str2(model_M5Str2_06_pred2$data ,"2006", legend = TRUE)   
+```
+
+
+# Overall comparisons 
+
+### Fits plots
+```{r}
+Ploted_fits_Str1<- print(plot_grid(
+    plot_M5_Str1_06 +
+      labs (y= expression(P[ij]),x="", title= " ", subtitle="2006") + 
+      scale_y_log10(labels = scales::label_number(),limits = c(1, NA)),ncol = 3))
+
+
+Ploted_fits_Str2<- print(plot_grid(
+plot_M4_Str2_06 +
+  labs (y= expression(P[ij]),x="", title= " ", subtitle="2006") +
+  scale_y_log10(labels = scales::label_number(),limits = c(1, NA)),
+ncol = 3))
+```
+
+
+## Choose distibutions:
+```{r}
+
+data <- Str1_06 %>%filter(!is.na(Abundance), !is.na(w_sn))
+pred_M3 <- predict(model_M3Str1_06, type = "response")
+pred_M4 <- predict(model_M4Str1_06, type = "response")
+pred_M5 <- predict(model_M5Str1_06, type = "response")
+obs <- data$Abundance
+rmse_Str1_06_M3 <- sqrt(mean((obs-pred_M3$est)^2, na.rm = TRUE))
+rmse_Str1_06_M4 <- sqrt(mean((obs-pred_M4$est)^2, na.rm = TRUE))
+rmse_Str1_06_M5 <- sqrt(mean((obs-pred_M5$est)^2, na.rm = TRUE))
+cor_Str1_06_M3  <- cor(obs, pred_M3$est, use = "complete.obs", method = "pearson")
+cor_Str1_06_M4  <- cor(obs, pred_M4$est, use = "complete.obs", method = "pearson")
+cor_Str1_06_M5  <- cor(obs, pred_M5$est, use = "complete.obs", method = "pearson")
+
+
+data <- Str2_06 %>%filter(!is.na(Abundance), !is.na(w_sn))
+pred_M3 <- predict(model_M3Str2_06, type = "response")
+pred_M4 <- predict(model_M4Str2_06, type = "response")
+obs <- data$Abundance
+  rmse_Str2_06_M3 <- sqrt(mean((obs-pred_M3$est)^2, na.rm = TRUE))
+  rmse_Str2_06_M4 <- sqrt(mean((obs-pred_M4$est)^2, na.rm = TRUE))
+  rmse_Str2_06_M5 <- NA
+  rmse_Str2_06_M7 <- NA
+  cor_Str2_06_M3  <- cor(obs, pred_M3$est, use = "complete.obs", method = "pearson")
+  cor_Str2_06_M4  <- cor(obs, pred_M4$est, use = "complete.obs", method = "pearson")
+  cor_Str2_06_M5 <- NA
+```
+
+## RMSE
+```{r}
+RMSE_sp<- tibble(dataset= c("Str1_06","Str2_06"),
+        
+        RMSE_M3= c(rmse_Str1_06_M3,rmse_Str2_06_M3),
+    
+        RMSE_M4= c(rmse_Str1_06_M4,rmse_Str2_06_M4),
+    
+        RMSE_M5= c(rmse_Str1_06_M5,rmse_Str2_06_M5),
+        
+        COR_M3= c(cor_Str1_06_M3, cor_Str2_06_M3),
+        
+        COR_M4= c(cor_Str1_06_M4,cor_Str2_06_M4),
+        
+        COR_M5= c(cor_Str1_06_M5,cor_Str2_06_M5),
+        
+        omega_M3 = c(omegaSD_M3_Str1_06,omegaSD_M3_Str2_06),
+        
+        omega_M4 = c(omegaSD_M4_Str1_06,omegaSD_M4_Str2_06),
+        
+        omega_M5 = c(omegaSD_M5_Str1_06,NA),
+        
+        zSD_M5 = c(svcSD_M5_Str1_06,NA),
+        
+        range_M3 = c(range_M3_Str1_06, range_M3_Str2_06),
+        
+        range_M4 = c(range_M4_Str1_06,range_M4_Str2_06),
+        
+        range_M5 = c(range_M5_Str1_06,NA),
+        
+        dispersion_M1 = c(dispersion_M1_Str1_06,dispersion_M1_Str2_06),
+        
+        dispersion_M2 = c(dispersion_M2_Str1_06,dispersion_M2_Str2_06),
+        
+        dispersion_M3 = c(dispersion_M3_Str1_06,dispersion_M3_Str2_06),
+      
+        dispersion_M4 = c(dispersion_M4_Str1_06,dispersion_M4_Str2_06),
+        
+        dispersion_M5 = c(dispersion_M5_Str1_06,NA))
+
+```
+
+```{r}
+RMSE
+RMSE_sp
+
+df_rmse<-  tibble(dataset=RMSE_sp$dataset,
+                 RMSE_M0=RMSE$RMSE_M0,RMSE_M1=RMSE$RMSE_M1, RMSE_M2=RMSE$RMSE_M2,
+                 RMSE_M3=RMSE_sp$RMSE_M3,RMSE_M4=RMSE_sp$RMSE_M4,RMSE_M5=RMSE_sp$RMSE_M5,
+                 Cor_M0= RMSE$COR_M0, Cor_M1= RMSE$COR_M1, Cor_M2= RMSE$COR_M2,
+                 Cor_M3= RMSE_sp$COR_M3, Cor_M4= RMSE_sp$COR_M4,Cor_M5= RMSE_sp$COR_M5,
+                 Disp_M1= RMSE_sp$dispersion_M1 , Disp_M2= RMSE_sp$dispersion_M2, Disp_M3= RMSE_sp$dispersion_M3, Disp_M4= RMSE_sp$dispersion_M4, Disp_M5= RMSE_sp$dispersion_M5)
+             
+df_rmse_long <- df_rmse %>%
+  select(dataset,
+       RMSE_M0, RMSE_M1, RMSE_M2, RMSE_M3, RMSE_M4,RMSE_M5) %>%pivot_longer(
+    cols = -dataset,
+    names_to = c(".value", "Model"),
+    names_pattern = "(RMSE|Cor)_(.*)",
+    values_to = "RMSE"
+  )
+
+df_rmse_long <- df_rmse_long %>%
+  mutate(
+    stratum = case_when(
+      str_detect(dataset, "^Str1") ~ "B. Eastern Stratum",
+      str_detect(dataset, "^Str2") ~ "A. Western Stratum"
+    )  )
+
+df_rmse_long <- df_rmse_long %>%
+  mutate(
+    year = as.integer(str_extract(dataset, "\\d{2}")),
+    year = 2000 + year)
+
+RMSE_plot<- 
+ggplot(df_rmse_long,
+       aes(x = as.factor(year), y = RMSE,
+           group = Model,
+           color = Model)) +
+  geom_line(linewidth = 0.3,position=position_dodge(width = 0.25)) +
+  geom_point(size = 1,position = position_dodge(width = 0.25)) +
+scale_colour_brewer(
+  name = "Model",
+  palette = "Dark2")+
+  facet_wrap(~stratum, ncol=1) +
+  theme_bw() +
+ theme(
+    strip.background = element_rect(
+    fill = "white",
+    colour = "black",
+  strip.background = element_blank(),
+  strip.text = element_text(face = "bold"))) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1)) +
+  labs(
+    x = "Year",
+    y = "RMSE",
+    color = "Model" ) 
+
+RMSE_plot
+
+```
+
+```{r}
+#Dispersion
+df_disp_long <- df_rmse %>%
+  select(dataset,
+       Disp_M1, Disp_M2, Disp_M3, Disp_M4, Disp_M5) %>%pivot_longer(
+    cols = -dataset,
+    names_to = c(".value", "Model"),
+    names_pattern = "(Disp)_(.*)",
+    values_to = "Disp"  )
+
+df_disp_long <- df_disp_long %>%
+  mutate(
+    stratum = case_when(
+      str_detect(dataset, "^Str1") ~ "B. Eastern Stratum",
+      str_detect(dataset, "^Str2") ~ "A. Western Stratum"   )  )
+
+df_disp_long <- df_disp_long %>%
+  mutate(
+    year = as.integer(str_extract(dataset, "\\d{2}")),
+    year = 2000 + year)
+
+Disp_plot <- 
+  ggplot(df_disp_long,
+         aes(x = as.factor(year), y = Disp,
+             group = Model,
+             color = Model)) +
+    # Background zones
+    geom_rect(
+        aes(xmin = -Inf, xmax = Inf, ymin = 0, ymax = 2, fill = "Negative Binomial"),
+        alpha = 0.5,
+        inherit.aes = FALSE     ) +
+    geom_rect(
+        aes(xmin = -Inf, xmax = Inf, ymin = 5.5, ymax = 15.5, fill = "Tweedie"),
+        alpha = 0.5,
+        inherit.aes = FALSE     ) +
+  #  Fill legend 
+  scale_fill_manual(
+  name = "Distribution",
+  values = c(
+    "Negative Binomial" = scales::alpha("lightblue", 0.3),
+    "Tweedie" = scales::alpha("lightpink", 0.3)))+
+  # Lines and points
+    geom_line(
+        linewidth = 0.3,
+        position = position_dodge(width = 0.25)) +
+    geom_point(
+        size = 1,
+        position = position_dodge(width = 0.25)) +
+  # Model colours
+  scale_color_manual(
+    name = "Model",
+    values = RColorBrewer::brewer.pal(6, "Dark2")[2:6])+
+  facet_wrap(~stratum) +
+     # Primary and secondary axes
+    scale_y_continuous(
+        name = "φ",
+        sec.axis = sec_axis(~ . / 10, name = "θ")) +
+ theme_bw() +
+ theme(
+    strip.background = element_rect(
+    fill = "white",
+    colour = "black",
+  strip.background = element_blank(),
+  strip.text = element_text(face = "bold"))) +
+theme(axis.text.x = element_text(angle = 45, hjust = 1),  axis.title.y = element_text(face = "italic")) +
+    labs(
+    x = "Year",
+    color = "Model" )
+
+Disp_plot
+```
+
+
