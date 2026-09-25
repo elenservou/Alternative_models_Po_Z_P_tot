@@ -1,0 +1,445 @@
+---
+title: "Anchovy embrios Aegean barrier Mesh sensitivity "
+author: "Eleni Servou"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-float: true
+    code-fold: true         
+    code-summary: "Hide/Show "
+    code-tools:
+      toggle: true                
+---
+
+## Load libraries and prepare data
+```{r}
+# Load packages
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(mapdata)
+library(rnaturalearth)
+library(rnaturalearthdata) 
+library(sf)
+library(sp)
+library(sdmTMB)
+library(sdmTMBextra)
+library(INLA)
+library(DHARMa)
+library(gstat)
+library(readxl)
+library(gt)
+library(visreg)
+library(ggeffects)
+library(cli)
+```
+
+```{r}
+#Data set (Eggs and larvae at age) 
+Str1_19<- read_xlsx("data.xlsx", sheet= "2019 east") ;Str1_19$Survey <- "Str1_19"
+Str2_19<- read_xlsx("data.xlsx", sheet= "2019 west") ;Str2_19$Survey <- "Str2_19"
+Str1_19$Survey <- "Str1_19"
+Str2_19$Survey <- "Str2_19"
+```
+
+```{r}
+#Data for maps
+#Coastline
+coast <- st_read("Greece_geology/Greece/land_poly_GR.gpkg",quiet = TRUE) %>%  st_transform(crs = "WGS84") 
+coast_km<-  st_transform(coast, crs = 32635);  
+st_geometry(coast_km) <- st_geometry(coast_km) / 1000  
+```
+
+## Estimate stations weights 
+```{r}
+
+ Str1_19_w<- Str1_19 %>%
+   distinct(Station, .keep_all = TRUE) %>%  mutate(total_km = sum(km_2, na.rm = TRUE)) %>%
+   mutate(w_sn=km_2/mean(km_2,na.rm=TRUE))
+   
+ Str1_19 <- Str1_19 %>%
+   left_join(Str1_19_w %>% select(Station,w_sn), by = "Station")  %>%
+  add_utm_columns(ll_names = c("Lon","Lat"), ll_crs = "WGS84",
+                  utm_crs = 32635, utm_names = c("X","Y"), units = "km")
+ 
+Str2_19_w<- Str2_19 %>%
+   distinct(Station, .keep_all = TRUE) %>%  mutate(total_km = sum(km_2, na.rm = TRUE)) %>%
+   mutate(w_sn=km_2/mean(km_2,na.rm=TRUE))
+   
+Str2_19 <- Str2_19 %>%
+   left_join(Str2_19_w %>% select(Station, w_sn), by = "Station")  %>%
+  add_utm_columns(ll_names = c("Lon","Lat"), ll_crs = "WGS84",
+                  utm_crs = 32635, utm_names = c("X","Y"), units = "km")
+```
+
+#Load and plot polygons for each stratum and year
+```{r}
+PA_2019_Str1 <- st_read("voronois/str1_sd_2019_dis.shp")  %>%  st_transform(crs = "WGS84")
+PA_2019_Str2 <- st_read("voronois/str2_sd_2019_dis.shp")  %>%  st_transform(crs = "WGS84")
+
+PA_2019_Str1 <- PA_2019_Str1 %>%  st_transform( crs = 32635) 
+st_geometry(PA_2019_Str1) <- st_geometry(PA_2019_Str1) / 1000 
+
+PA_2019_Str2 <- PA_2019_Str2 %>%  st_transform( crs = 32635) 
+st_geometry(PA_2019_Str2) <- st_geometry(PA_2019_Str2) / 1000 
+```
+
+# Mesh sensitivity analysis 
+Because the area have several islands and a complex coastline we will implement a barrier mesh. 
+ 
+To optimize mesh characteristics, we followed the empirical recommendations of Zuur et al. (2017), Zuur & Ieno (2018) and H. Baka repository (https://haakonbakkagit.github.io/, accessed 30-09-2025). Specifically, 
+ The cutoff distance should be approximately 1/5 of the max.edge of the inner area.
+The max.edge can be approximated as 1/5 of an expected/guessed autocorrelation range.
+The resolution of the outer area can be lower, with a general recommended inner-to-outer ratio of 1:5. 
+Offset is recommended to extend to 2/3 of the expected range.
+
+We run a sensitivity analysis to select the optimal mesh.
+
+First we assume an expected/guessed autocorrelation range of 23nmi (42.5Km) and flowing the above recommendations we fit the M3 and 4 spatial models formulation
+
+Except for theguessed autocorrelation range we fitted the same models with several meshes of higher and lower resolutions.
+Models are compared using the AIC criterion and the mesh that resulted to the model fit with the lower AIC was selected as the one with the optimal mesh characteristics.
+
+##BARIER MESHES for the Spatial Models
+```{r}
+###########################
+#  Create the barrier mesh
+###########################
+create_mesh_Str1<- function(data,PA_polygone,edge_est_nmi)
+{
+df_name <- deparse(substitute(data))
+mesh_name <- paste0("bspde", df_name,edge_est_nmi)
+
+data <- data %>% filter(!is.na(Abundance))
+data <- data %>% filter(!is.na(w_sn))
+data.eggs <- data
+
+poly.coast <- coast # Greek shp WGS84 
+stations_sf <- st_as_sf(data.eggs, coords = c("Lon","Lat"), crs = 4326) 
+plot(stations_sf$geometry, pch=19, col=2)
+
+#Create a convex hull polygon around all stations 
+transect_poly <- st_convex_hull(st_union(stations_sf))
+
+# Buffer around the transect polygon (e.g., 0.1 degrees ~ ~10km depending on latitude)
+buff <- st_buffer(transect_poly, dist = 10000) # WGS84 degrees; or use UTM for meters
+plot(buff, col = "lightblue", border = "blue");plot(stations_sf$geometry, add = TRUE, pch = 19, col = 2)
+
+output = st_intersection(buff,poly.coast)
+plot(output,col=3)
+domain = st_difference(transect_poly,st_union(output)) 
+domain = st_sf(domain)
+
+domain_utm <- st_transform(domain, "+init=epsg:32635 +units=km")
+plot(domain_utm,col=4,axes=T);plot(data.eggs$X, data.eggs$Y, pch="+",add=T)
+
+# Mesh characteristics, expected variogram range (~25 nm)
+max.edge =edge_est_nmi 
+range_est =max.edge*5 
+bound.outer = range_est*(2/3)
+
+#force geometries to be valid:
+poly.coast <- st_make_valid(poly.coast)
+domain_utm <- st_make_valid(domain_utm)
+
+# Build high-resolution mesh
+mesh_high = inla.mesh.2d( 
+  boundary = domain_utm, 
+  loc = cbind(data.eggs$X, data.eggs$Y),
+  max.edge = c(1,5)*max.edge,
+  cutoff = max.edge/5, 
+  offset = c(max.edge, bound.outer)
+  )
+
+plot(mesh_high, lwd=0.5, axes = T); points(data.eggs$X, data.eggs$Y, col="red")
+mesh_high <- make_mesh(data.eggs, c("X", "Y"), mesh = mesh_high) 
+plot(mesh_high, lwd=0.5, axes = T); points(data.eggs$X, data.eggs$Y, col="red")
+
+# Add on the barrier mesh component
+poly.coast_utm <- st_transform(poly.coast, "+init=epsg:32635 +units=km")
+bspde <- add_barrier_mesh(
+  spde_obj = mesh_high,
+  barrier_sf = poly.coast_utm,
+  range_fraction = 0.1,
+  proj_scaling = 1,
+  plot = TRUE)
+plot(bspde, lwd=0.5); points(data.eggs$X, data.eggs$Y, col="red")
+assign(mesh_name, bspde, envir = .GlobalEnv)
+
+}
+
+
+create_mesh_Str2<- function(data,PA_polygone,edge_est_nmi)
+{
+
+df_name <- deparse(substitute(data))
+mesh_name <- paste0("bspde", df_name,edge_est_nmi)
+
+data <- data %>% filter(!is.na(Abundance))
+data <- data %>% filter(!is.na(w_sn))
+data.eggs <- data
+
+poly.coast <- coast # Greek shp WGS84 
+stations_sf <- st_as_sf(data.eggs, coords = c("Lon","Lat"), crs = 4326) 
+plot(stations_sf$geometry, pch=19, col=2)
+
+#Create a convex hull polygon around all stations 
+transect_poly <- st_convex_hull(st_union(stations_sf))
+
+# Buffer around the transect polygon (e.g., 0.1 degrees ~ ~10km depending on latitude)
+buff <- st_buffer(transect_poly, dist = 10000) # WGS84 degrees; or use UTM for meters
+plot(buff, col = "lightblue", border = "blue");plot(stations_sf$geometry, add = TRUE, pch = 19, col = 2)
+
+output = st_intersection(buff,poly.coast)
+plot(output,col=3)
+domain = st_difference(transect_poly,st_union(output)) 
+domain = st_sf(domain)
+
+domain_utm <- st_transform(domain, "+init=epsg:32635 +units=km")
+plot(domain_utm,col=4,axes=T);plot(data.eggs$X, data.eggs$Y, pch="+",add=T)
+
+# Mesh characteristics, e
+range_est<-  edge_est_nmi*5  
+max.edge <- edge_est_nmi
+bound.outer = range_est*(2/3)
+
+#force geometries to be valid:
+poly.coast <- st_make_valid(poly.coast)
+domain_utm <- st_make_valid(domain_utm)
+
+# Build high-resolution mesh
+mesh_high = inla.mesh.2d( 
+  boundary = domain_utm, 
+  loc = cbind(data.eggs$X, data.eggs$Y),
+  max.edge = c(1,5)*max.edge,
+  cutoff = max.edge/5, 
+  offset = c(max.edge, bound.outer)
+  )
+
+plot(mesh_high, lwd=0.5, axes = T); points(data.eggs$X, data.eggs$Y, col="red")
+mesh_high <- make_mesh(data.eggs, c("X", "Y"), mesh = mesh_high) 
+plot(mesh_high, lwd=0.5, axes = T); points(data.eggs$X, data.eggs$Y, col="red")
+
+# Add on the barrier mesh component
+poly.coast_utm <- st_transform(poly.coast, "+init=epsg:32635 +units=km")
+bspde <- add_barrier_mesh(
+  spde_obj = mesh_high,
+  barrier_sf = poly.coast_utm,
+  range_fraction = 0.1,
+  proj_scaling = 1,
+  plot = TRUE)
+
+plot(bspde, lwd=0.5); points(data.eggs$X, data.eggs$Y, col="red")
+assign(mesh_name, bspde, envir = .GlobalEnv)
+}
+
+```
+
+## Code to fit spatial NB and Tweede model 
+```{r}
+fit_glm_NBsp_M3 <- function(data,PA_polygone,bspde) {
+ 
+# Get data frame name
+df_name <- deparse(substitute(data))
+bspde_name <- deparse(substitute(bspde))
+model_name <- paste0("model_M3", df_name,bspde_name)
+Survey <- as.character(data$Survey[1])
+
+data <- data %>% filter(!is.na(Abundance))
+data <- data %>% filter(!is.na(w_sn))
+Year <- as.character(data$Year[1])
+
+# Fit model
+model3 <-  sdmTMB(
+  Ni ~ 1 + (Age),
+  data = data,
+  offset= log(data$Ri), # log because we are at the logit 
+  family = nbinom2(link = "log"),
+  mesh = bspde,
+  spatial = "on")  
+
+assign(model_name, model3, envir = .GlobalEnv)
+
+#Summary
+summary(model3)
+sanity(model3)
+}
+
+fit_glm_TWsp_M4 <- function(data,PA_polygone,bspde) {
+ 
+# Get data frame name
+df_name <- deparse(substitute(data))
+bspde_name <- deparse(substitute(bspde))
+model_name <- paste0("model_M4", df_name,bspde_name)
+Survey <- as.character(data$Survey[1])
+
+data <- data %>% filter(!is.na(Abundance))
+data <- data %>% filter(!is.na(w_sn))
+Year <- as.character(data$Year[1])
+
+# Fit model
+model4 <-  sdmTMB(
+  Abundance ~ 1 + (Age),
+  data = data,
+  family = tweedie(link = "log"),
+  mesh = bspde,
+  spatial = "on")  
+
+assign(model_name, model4, envir = .GlobalEnv)
+
+#Summary
+summary(model4)
+sanity(model4)
+}
+```
+## Str1_2006 --> select edge_est_nmi=22  based on M3 & M4
+### Fit the meshes
+```{r}
+create_mesh_Str1(Str1_06, PA_2006_Str1,edge_est_nmi=5)  
+create_mesh_Str1(Str1_06, PA_2006_Str1,edge_est_nmi=7) 
+create_mesh_Str1(Str1_06, PA_2006_Str1,edge_est_nmi=8.5) 
+create_mesh_Str1(Str1_06, PA_2006_Str1,edge_est_nmi=10) 
+create_mesh_Str1(Str1_06, PA_2006_Str1,edge_est_nmi=12) 
+create_mesh_Str1(Str1_06, PA_2006_Str1,edge_est_nmi=15) 
+create_mesh_Str1(Str1_06, PA_2006_Str1,edge_est_nmi=20)
+create_mesh_Str1(Str1_06, PA_2006_Str1,edge_est_nmi=22)
+create_mesh_Str1(Str1_06, PA_2006_Str1,edge_est_nmi=25)
+create_mesh_Str1(Str1_06, PA_2006_Str1,edge_est_nmi=27)
+```
+
+### Fit the models
+```{r}
+fit_glm_NBsp_M3(Str1_06,PA_2006_Str1,bspdeStr1_065)   #Matern range too small
+fit_glm_NBsp_M3(Str1_06,PA_2006_Str1,bspdeStr1_067) 
+fit_glm_NBsp_M3(Str1_06,PA_2006_Str1,bspdeStr1_068.5) #Matern range too small
+fit_glm_NBsp_M3(Str1_06,PA_2006_Str1,bspdeStr1_0610)
+fit_glm_NBsp_M3(Str1_06,PA_2006_Str1,bspdeStr1_0612) 
+fit_glm_NBsp_M3(Str1_06,PA_2006_Str1,bspdeStr1_0615)
+fit_glm_NBsp_M3(Str1_06,PA_2006_Str1,bspdeStr1_0620)
+fit_glm_NBsp_M3(Str1_06,PA_2006_Str1,bspdeStr1_0622)
+fit_glm_NBsp_M3(Str1_06,PA_2006_Str1,bspdeStr1_0625)
+fit_glm_NBsp_M3(Str1_06,PA_2006_Str1,bspdeStr1_0627)
+
+fit_glm_TWsp_M4(Str1_06,PA_2006_Str1,bspdeStr1_065)  #Matern range too small
+fit_glm_TWsp_M4(Str1_06,PA_2006_Str1,bspdeStr1_067)  
+fit_glm_TWsp_M4(Str1_06,PA_2006_Str1,bspdeStr1_068.5) 
+fit_glm_TWsp_M4(Str1_06,PA_2006_Str1,bspdeStr1_0610)
+fit_glm_TWsp_M4(Str1_06,PA_2006_Str1,bspdeStr1_0612)
+fit_glm_TWsp_M4(Str1_06,PA_2006_Str1,bspdeStr1_0615)
+fit_glm_TWsp_M4(Str1_06,PA_2006_Str1,bspdeStr1_0620)
+fit_glm_TWsp_M4(Str1_06,PA_2006_Str1,bspdeStr1_0622)
+fit_glm_TWsp_M4(Str1_06,PA_2006_Str1,bspdeStr1_0625)
+fit_glm_TWsp_M4(Str1_06,PA_2006_Str1,bspdeStr1_0627)
+```
+
+### Compare models and decide the edge
+```{r}
+modelsM3 <- list(m3_5=      model_M3Str1_06bspdeStr1_065,
+                 m3_7=      model_M3Str1_06bspdeStr1_067,   
+                 m3_8.5 =   model_M3Str1_06bspdeStr1_068.5, 
+                 m3_10=     model_M3Str1_06bspdeStr1_0610,  
+                 m3_12=     model_M3Str1_06bspdeStr1_0612, 
+                 m3_15=     model_M3Str1_06bspdeStr1_0615,
+                 m3_20=     model_M3Str1_06bspdeStr1_0620,
+                 m3_22=     model_M3Str1_06bspdeStr1_0622,
+                 m3_25=     model_M3Str1_06bspdeStr1_0625,
+                 m3_27=     model_M3Str1_06bspdeStr1_0627)
+
+modelsM4 <- list(m4_5=      model_M4Str1_06bspdeStr1_065,
+                 m4_7=      model_M4Str1_06bspdeStr1_067,   
+                 m4_8.5 =   model_M4Str1_06bspdeStr1_068.5, 
+                 m4_10=     model_M4Str1_06bspdeStr1_0610,  
+                 m4_12=     model_M4Str1_06bspdeStr1_0612, 
+                 m4_15=     model_M4Str1_06bspdeStr1_0615,
+                 m4_20=     model_M4Str1_06bspdeStr1_0620,
+                 m4_22=     model_M4Str1_06bspdeStr1_0622,
+                 m4_25=     model_M4Str1_06bspdeStr1_0625,
+                 m4_27=     model_M4Str1_06bspdeStr1_0627)
+
+AIC_dfM3 <- tibble(
+  model = names(modelsM3),
+  AIC = sapply(modelsM3, AIC)
+) %>% mutate(ΔAIC = AIC - min(AIC))
+AIC_dfM3<- AIC_dfM3 %>% filter(model %in% c("m3_5","m3_7","m3_8.5", "m3_10","m3_12", "m3_15", "m3_20","m3_22","m3_25","m3_27")) %>% mutate(ΔAIC = AIC - min(AIC))
+AIC_dfM3
+
+AIC_dfM4 <- tibble(
+  model = names(modelsM4),
+  AIC = sapply(modelsM4, AIC)
+) %>% mutate(ΔAIC = AIC - min(AIC))
+AIC_dfM4<- AIC_dfM4 %>% filter(model %in% c("m4_5","m4_7","m4_8.5", "m4_10","m4_12", "m4_15", "m4_20","m4_22","m4_25","m4_27")) %>% mutate(ΔAIC = AIC - min(AIC))
+AIC_dfM4
+```
+
+
+## Str2_2006 --> select edge_est_nmi= 7   based on M3 & M4
+### Fit the meshes
+```{r}
+create_mesh_Str2(Str2_06, PA_2006_Str2,edge_est_nmi=5) 
+create_mesh_Str2(Str2_06, PA_2006_Str2,edge_est_nmi=7) 
+create_mesh_Str2(Str2_06, PA_2006_Str2,edge_est_nmi=8.5) 
+create_mesh_Str2(Str2_06, PA_2006_Str2,edge_est_nmi=10) 
+create_mesh_Str2(Str2_06, PA_2006_Str2,edge_est_nmi=12) 
+create_mesh_Str2(Str2_06, PA_2006_Str2,edge_est_nmi=15) 
+create_mesh_Str2(Str2_06, PA_2006_Str2,edge_est_nmi=20)
+create_mesh_Str2(Str2_06, PA_2006_Str2,edge_est_nmi=22)
+```
+
+### Fit the models
+```{r}
+fit_glm_NBsp_M3(Str2_06,PA_2006_Str2,bspdeStr2_065)   
+fit_glm_NBsp_M3(Str2_06,PA_2006_Str2,bspdeStr2_068.5)
+fit_glm_NBsp_M3(Str2_06,PA_2006_Str2,bspdeStr2_0610)
+fit_glm_NBsp_M3(Str2_06,PA_2006_Str2,bspdeStr2_0612)  
+fit_glm_NBsp_M3(Str2_06,PA_2006_Str2,bspdeStr2_0615) 
+fit_glm_NBsp_M3(Str2_06,PA_2006_Str2,bspdeStr2_0620)
+fit_glm_NBsp_M3(Str2_06,PA_2006_Str2,bspdeStr2_0622)
+
+fit_glm_TWsp_M4(Str2_06,PA_2006_Str2,bspdeStr2_065)  
+fit_glm_TWsp_M4(Str2_06,PA_2006_Str2,bspdeStr2_067)  
+fit_glm_TWsp_M4(Str2_06,PA_2006_Str2,bspdeStr2_068.5) 
+fit_glm_TWsp_M4(Str2_06,PA_2006_Str2,bspdeStr2_0610)
+fit_glm_TWsp_M4(Str2_06,PA_2006_Str2,bspdeStr2_0612)  
+fit_glm_TWsp_M4(Str2_06,PA_2006_Str2,bspdeStr2_0615)  
+fit_glm_TWsp_M4(Str2_06,PA_2006_Str2,bspdeStr2_0620)
+fit_glm_TWsp_M4(Str2_06,PA_2006_Str2,bspdeStr2_0622)
+```
+
+### Compare models and decide the edge
+```{r}
+modelsM3 <- list(m3_5=      model_M3Str2_06bspdeStr2_065,
+                 m3_7=      model_M3Str2_06bspdeStr2_067,   
+                 m3_8.5 =   model_M3Str2_06bspdeStr2_068.5, 
+                 m3_10=     model_M3Str2_06bspdeStr2_0610,  
+                 m3_12=     model_M3Str2_06bspdeStr2_0612, 
+                 m3_15=     model_M3Str2_06bspdeStr2_0615,
+                 m3_20=     model_M3Str2_06bspdeStr2_0620,
+                 m3_22=     model_M3Str2_06bspdeStr2_0622)
+
+modelsM4 <- list(m4_5=      model_M4Str2_06bspdeStr2_065,
+                 m4_7=      model_M4Str2_06bspdeStr2_067,   
+                 m4_8.5 =   model_M4Str2_06bspdeStr2_068.5, 
+                 m4_10=     model_M4Str2_06bspdeStr2_0610,  
+                 m4_12=     model_M4Str2_06bspdeStr2_0612, 
+                 m4_15=     model_M4Str2_06bspdeStr2_0615,
+                 m4_20=     model_M4Str2_06bspdeStr2_0620,
+                 m4_22=     model_M4Str2_06bspdeStr2_0622)
+
+AIC_dfM3 <- tibble(
+  model = names(modelsM3),
+  AIC = sapply(modelsM3, AIC)
+) %>% mutate(ΔAIC = AIC - min(AIC))
+AIC_dfM3<- AIC_dfM3 %>% filter(model %in% c("m3_5","m3_7","m3_8.5", "m3_10","m3_12", "m3_15", "m3_20", "m3_22")) %>% mutate(ΔAIC = AIC - min(AIC))
+AIC_dfM3
+
+AIC_dfM4 <- tibble(
+  model = names(modelsM4),
+  AIC = sapply(modelsM4, AIC)
+) %>% mutate(ΔAIC = AIC - min(AIC))
+AIC_dfM4<- AIC_dfM4 %>% filter(model %in% c("m4_5","m4_7","m4_8.5", "m4_10","m4_12", "m4_15", "m4_20","m4_22")) %>% mutate(ΔAIC = AIC - min(AIC))
+AIC_dfM4
+```
+
+
